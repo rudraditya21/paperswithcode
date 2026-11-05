@@ -38,7 +38,7 @@ The goal is to split up those tasks in the future.
 - `continual-learning` — Continual Learning
 - `pseudo-labelling` — Pseudo Labelling
 - `embedding-models` — Embedding models
-- `remote-sensing` — Remote Sensing
+- `explainable-ai` — Explainable AI
 
 ### Language
 
@@ -182,6 +182,7 @@ This compact index contains every current task and subtask. Treat names and slug
 - `end-to-end-autonomous-driving` — End-to-End Autonomous Driving
 - `entity-resolution` — Entity Resolution
 - `entity-typing` — Entity Typing
+- `explainable-ai` — Explainable AI
 - `face-anti-spoofing` — Face Anti-Spoofing
 - `face-detection` — Face Detection
 - `face-recognition` — Face Recognition
@@ -304,6 +305,7 @@ This compact index contains every current task and subtask. Treat names and slug
 - `scene-graph-generation` — Scene Graph Generation
 - `scene-text-detection` — Scene Text Detection
 - `scene-text-recognition` — Scene Text Recognition
+- `scientific-reasoning` — Scientific Reasoning
 - `semi-supervised-image-classification` — Semi-Supervised Image Classification
 - `semi-supervised-object-detection` — Semi-Supervised Object Detection
 - `sentiment-analysis` — Sentiment Analysis
@@ -330,6 +332,7 @@ This compact index contains every current task and subtask. Treat names and slug
 - `tabular-learning` — Tabular Learning
 - `talking-head-generation` — Talking Head Generation
 - `temporal-action-localization` — Temporal Action Localization
+- `temporal-action-segmentation` — Temporal Action Segmentation
 - `temporal-graph-learning` — Temporal Graph Learning
 - `test-time-adaptation` — Test-time Adaptation
 - `text-classification` — Text classification
