@@ -14,16 +14,19 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
-    Dataset,
     Evaluation,
     HfArtifact,
-    Metric,
     Paper,
     PaperHfArtifact,
-    Task,
-    TaskDatasetMetric,
 )
 from backend.services.evaluation_service import EvaluationService
+from backend.services.leaderboard_model_matching_service import (
+    LeaderboardModel,
+    LeaderboardModelMatcher,
+)
+from backend.services.leaderboard_sync_catalog import (
+    resolve_leaderboard,
+)
 from backend.services.leaderboard_sync_ownership import managed_methodology_prefix
 
 BENCHMARK_NAME = "MTEB(Multilingual, v2)"
@@ -34,16 +37,8 @@ MMTEB_API_URL = (
 DATASET_SLUG = "mmteb-v2"
 MIN_EXPECTED_ENTRIES = 100
 MAX_EXPECTED_ENTRIES = 2_000
-MIN_SCORED_ENTRIES = {
-    "overall": 25,
-    "retrieval": 50,
-    "reranking": 50,
-}
-MIN_RESOLVED_ENTRIES = {
-    "overall": 10,
-    "retrieval": 20,
-    "reranking": 20,
-}
+MIN_SCORED_ENTRIES = {"overall": 25}
+MIN_RESOLVED_ENTRIES = {"overall": 10}
 MANAGED_METHODOLOGY_PREFIX = managed_methodology_prefix("MMTEB v2")
 LEGACY_METHODOLOGY_PREFIX = (
     "Official MTEB leaderboard external evaluation for MTEB(Multilingual, v2):"
@@ -76,7 +71,6 @@ MODEL_ARXIV_OVERRIDES = {
 class MmtebLane:
     task_slug: str
     metric_name: str
-    api_score_key: str | None
     api_score_label: str
 
 
@@ -84,20 +78,7 @@ LANES: dict[str, MmtebLane] = {
     "overall": MmtebLane(
         task_slug="embedding-models",
         metric_name="MMTEB Score",
-        api_score_key=None,
         api_score_label="meanTask",
-    ),
-    "retrieval": MmtebLane(
-        task_slug="retrieval",
-        metric_name="Retrieval",
-        api_score_key="Retrieval",
-        api_score_label='scoresByTaskType["Retrieval"]',
-    ),
-    "reranking": MmtebLane(
-        task_slug="text-reranking",
-        metric_name="Rerank",
-        api_score_key="Reranking",
-        api_score_label='scoresByTaskType["Reranking"]',
     ),
 }
 
@@ -108,19 +89,15 @@ class MmtebEntry:
     model_url: str
     api_rank: int
     mean_task: float | None
-    scores_by_task_type: dict[str, float]
     arxiv_ids: tuple[str, ...]
     total_params: int | None
     is_open: bool
     hf_model_url: str | None
+    # Hub organization of the upstream model name ("intfloat/e5-..." -> "intfloat").
+    organization: str = ""
 
     def score_for(self, lane: MmtebLane) -> float | None:
-        raw = (
-            self.mean_task
-            if lane.api_score_key is None
-            else self.scores_by_task_type.get(lane.api_score_key)
-        )
-        return None if raw is None else raw * 100
+        return None if self.mean_task is None else self.mean_task * 100
 
 
 @dataclass
@@ -131,6 +108,7 @@ class MmtebSyncStats:
     created: int = 0
     updated: int = 0
     deleted: int = 0
+    auto_matched: list[str] = field(default_factory=list)
     no_arxiv_models: list[str] = field(default_factory=list)
     missing_papers: list[str] = field(default_factory=list)
     ambiguous_papers: list[str] = field(default_factory=list)
@@ -144,6 +122,7 @@ class MmtebSyncStats:
             "created": self.created,
             "updated": self.updated,
             "deleted": self.deleted,
+            "auto_matched": self.auto_matched,
             "no_arxiv_models": self.no_arxiv_models,
             "missing_papers": self.missing_papers,
             "ambiguous_papers": self.ambiguous_papers,
@@ -194,16 +173,8 @@ def parse_mmteb_leaderboard(payload: Any) -> list[MmtebEntry]:
         raise ValueError(
             "MMTEB API benchmark name does not match the configured source"
         )
-    task_types = payload.get("taskTypes")
-    if not isinstance(task_types, list) or not {"Retrieval", "Reranking"}.issubset(
-        task_types
-    ):
-        raise ValueError("MMTEB API task types do not include retrieval and reranking")
     aggregations = payload.get("aggregations")
-    if not isinstance(aggregations, list) or not {
-        "mean_task",
-        "task_types",
-    }.issubset(aggregations):
+    if not isinstance(aggregations, list) or "mean_task" not in aggregations:
         raise ValueError("MMTEB API aggregations do not match the published contract")
     rows = payload.get("rows")
     if not isinstance(rows, list):
@@ -223,7 +194,7 @@ def parse_mmteb_leaderboard(payload: Any) -> list[MmtebEntry]:
         canonical_name = model.get("name")
         if not isinstance(canonical_name, str) or not canonical_name.strip():
             raise ValueError("MMTEB API model names must be non-empty strings")
-        model_name = canonical_name.rstrip("/").rsplit("/", 1)[-1]
+        organization, _, model_name = canonical_name.rstrip("/").rpartition("/")
         if len(model_name) > 255 or model_name in names:
             raise ValueError("MMTEB model names must be unique and at most 255 chars")
         names.add(model_name)
@@ -234,19 +205,6 @@ def parse_mmteb_leaderboard(payload: Any) -> list[MmtebEntry]:
             raise ValueError(f"MMTEB API rank is invalid for {model_name}") from exc
         if api_rank < 1:
             raise ValueError(f"MMTEB API rank is invalid for {model_name}")
-
-        scores_raw = row.get("scoresByTaskType")
-        if not isinstance(scores_raw, dict):
-            raise TypeError(f"MMTEB task-type scores are invalid for {model_name}")
-        scores: dict[str, float] = {}
-        for key in ("Retrieval", "Reranking"):
-            score = _optional_score(
-                scores_raw.get(key),
-                field_name=f"{key} score",
-                model_name=model_name,
-            )
-            if score is not None:
-                scores[key] = score
 
         total_params_b = model.get("totalParamsB")
         total_params: int | None = None
@@ -279,11 +237,11 @@ def parse_mmteb_leaderboard(payload: Any) -> list[MmtebEntry]:
                     field_name="meanTask",
                     model_name=model_name,
                 ),
-                scores_by_task_type=scores,
                 arxiv_ids=_arxiv_ids(model.get("citation")),
                 total_params=total_params,
                 is_open=open_weights,
                 hf_model_url=_official_hf_model_url(canonical_name, model_url),
+                organization=organization,
             )
         )
     return entries
@@ -319,37 +277,10 @@ def _hf_repo_id(url: str | None) -> str | None:
 
 
 class MmtebSyncService:
-    """Replace one task-specific MMTEB lane with arXiv-backed API rows."""
+    """Replace the managed MMTEB v2 rows with arXiv-backed API rows."""
 
     def __init__(self, db: Session):
         self.db = db
-
-    def _leaderboard_identity(self, lane: MmtebLane) -> tuple[Task, Dataset]:
-        task = self.db.query(Task).filter(Task.slug == lane.task_slug).one_or_none()
-        dataset = (
-            self.db.query(Dataset).filter(Dataset.slug == DATASET_SLUG).one_or_none()
-        )
-        metric = (
-            self.db.query(Metric).filter(Metric.name == lane.metric_name).one_or_none()
-        )
-        if task is None or dataset is None or metric is None:
-            raise RuntimeError(
-                f"MMTEB {lane.task_slug} task, benchmark, or metric is not configured"
-            )
-        configured = (
-            self.db.query(TaskDatasetMetric)
-            .filter(
-                TaskDatasetMetric.task_id == task.id,
-                TaskDatasetMetric.dataset_id == dataset.id,
-                TaskDatasetMetric.metric_id == metric.id,
-            )
-            .one_or_none()
-        )
-        if configured is None:
-            raise RuntimeError(
-                f"MMTEB {lane.metric_name} metric is not linked to {lane.task_slug}"
-            )
-        return task, dataset
 
     def _resolve_papers(
         self,
@@ -432,6 +363,7 @@ class MmtebSyncService:
         fetched: int,
         scored: int,
         resolved: int,
+        auto_matched: int,
         existing_managed: int,
     ) -> None:
         if fetched < MIN_EXPECTED_ENTRIES:
@@ -446,9 +378,10 @@ class MmtebSyncService:
                 f"MMTEB {lane_id} resolved only {resolved} arXiv-backed rows; "
                 "refusing to replace the managed leaderboard"
             )
-        if existing_managed and resolved * 2 < existing_managed:
+        published = resolved + auto_matched
+        if existing_managed and published * 2 < existing_managed:
             raise RuntimeError(
-                f"MMTEB {lane_id} resolved {resolved} rows versus "
+                f"MMTEB {lane_id} resolved {published} rows versus "
                 f"{existing_managed} managed rows; refusing a drop over 50%"
             )
 
@@ -472,12 +405,40 @@ class MmtebSyncService:
         stats = MmtebSyncStats(fetched=len(entries))
 
         try:
-            task, dataset = self._leaderboard_identity(lane)
+            task, dataset = resolve_leaderboard(
+                self.db,
+                f"MMTEB {lane.task_slug}",
+                lane.task_slug,
+                DATASET_SLUG,
+                (lane.metric_name,),
+            )
             scored_entries = [
                 entry for entry in entries if entry.score_for(lane) is not None
             ]
             stats.scored = len(scored_entries)
             papers_by_model = self._resolve_papers(scored_entries, stats)
+            # Models without a cited local paper go to the shared matcher; the
+            # rest become release-radar signals. Ambiguous citations stay out.
+            ambiguous = set(stats.ambiguous_papers)
+            unknown = [
+                LeaderboardModel(entry.model_name, entry.organization)
+                for entry in scored_entries
+                if entry.model_name not in papers_by_model
+                and f"{entry.model_name}:{','.join(entry.arxiv_ids)}" not in ambiguous
+            ]
+            matcher = LeaderboardModelMatcher(
+                self.db,
+                provider="mmteb",
+                leaderboard_name="MMTEB v2",
+                leaderboard_url=MMTEB_API_URL,
+            )
+            auto_matched = matcher.match(unknown)
+            auto_papers = {
+                paper.id: paper
+                for paper in self.db.query(Paper)
+                .filter(Paper.id.in_({m.paper_id for m in auto_matched.values()}))
+                .all()
+            }
             managed_rows = (
                 self.db.query(Evaluation)
                 .filter(
@@ -497,6 +458,7 @@ class MmtebSyncService:
                 fetched=len(entries),
                 scored=len(scored_entries),
                 resolved=len(papers_by_model),
+                auto_matched=len(auto_matched),
                 existing_managed=len(managed_rows),
             )
             managed_ids = {row.id for row in managed_rows}
@@ -513,10 +475,13 @@ class MmtebSyncService:
                 )
                 if row_id not in managed_ids
             }
-            current_names = set(papers_by_model)
+            current_names = set(papers_by_model) | set(auto_matched)
 
             for entry in scored_entries:
                 paper = papers_by_model.get(entry.model_name)
+                match = auto_matched.get(entry.model_name)
+                if paper is None and match is not None:
+                    paper = auto_papers[match.paper_id]
                 if paper is None:
                     continue
                 if (
@@ -530,8 +495,13 @@ class MmtebSyncService:
                 methodology = (
                     f"{MANAGED_METHODOLOGY_PREFIX} {BENCHMARK_NAME} "
                     f"{lane.api_score_label} × 100; official API Borda rank "
-                    f"{entry.api_rank}; fetched {now.isoformat()}. Only models with "
-                    "an unambiguous local arXiv paper are synchronized."
+                    f"{entry.api_rank}; fetched {now.isoformat()}. "
+                    + (
+                        "Matched to the model's release paper by name."
+                        if match is not None
+                        else "Only models with an unambiguous local arXiv paper "
+                        "are synchronized."
+                    )
                 )
                 row = managed_by_name.get(entry.model_name)
                 if row is None:
@@ -552,19 +522,37 @@ class MmtebSyncService:
                 row.uses_additional_data = False
                 row.is_open = entry.is_open
                 row.num_parameters = entry.total_params
-                row.hf_model_url = entry.hf_model_url
+                row.hf_model_url = entry.hf_model_url or (
+                    match.hf_model_url if match is not None else None
+                )
                 row.evaluated_on = now.date()
                 row.external_source_url = MMTEB_API_URL
                 row.source_url = MMTEB_API_URL
                 row.external = True
                 row.updated_at = now
-                if entry.hf_model_url:
+                if match is not None:
+                    stats.auto_matched.append(entry.model_name)
+                elif entry.hf_model_url:
                     hf_models = list(paper.hf_models or [])
                     if entry.hf_model_url not in hf_models:
                         hf_models.append(entry.hf_model_url)
                         paper.hf_models = hf_models
                 stats.matched += 1
 
+            # Auto-matched models are published, so they are not reported as
+            # missing; the rest become release-radar signals.
+            published = set(stats.auto_matched)
+            stats.no_arxiv_models = [
+                name for name in stats.no_arxiv_models if name not in published
+            ]
+            stats.missing_papers = [
+                item
+                for item in stats.missing_papers
+                if item.rpartition(":")[0] not in published
+            ]
+            matcher.report_unmatched(
+                [model for model in unknown if model.name not in auto_matched]
+            )
             for row in managed_rows:
                 if row.model_name not in current_names:
                     self.db.delete(row)

@@ -3,15 +3,17 @@
 from datetime import date, datetime, timedelta
 import re
 import secrets
+from collections.abc import Sequence
 from typing import NamedTuple
 
 from fastapi import HTTPException
-from sqlalchemy import Integer, String, column, select, text
+from sqlalchemy import Integer, String, and_, column, exists, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
     Author,
+    AuthorPhoto,
     Dataset,
     Method,
     Organization,
@@ -23,9 +25,18 @@ from backend.models.database.research import (
     ResearchSubscription,
     ResearchSuppression,
 )
-from backend.models.research import FollowView, ResearchEntry, ResearchFeedEntry
-from backend.models.database.research import ResearchTopic
+from backend.models.research import (
+    FollowSuggestion,
+    FollowSuggestions,
+    FollowView,
+    ResearchEntry,
+    ResearchFeedEntry,
+)
+from backend.models.database.research import ResearchTopic, ResearchTopicFollow
+from backend.services.organization_service import OrganizationService
 from backend.services.research_topic_service import THRESHOLD as TOPIC_THRESHOLD
+from backend.services.research_topic_service import capitalized
+from backend.utils.author_photos import author_image_url
 
 ENTITIES = {
     "task": (Task, "tasks"),
@@ -35,6 +46,65 @@ ENTITIES = {
     "organization": (Organization, "orgs"),
 }
 
+# Well-known researchers; author popularity has no data signal, since citation
+# ranks favour coauthors of a few huge papers.
+POPULAR_AUTHOR_IDS = (266, 4049, 13379, 25, 264)
+# Enough organizations to still fill five chips after hiding followed ones.
+POPULAR_ORGANIZATION_LIMIT = 10
+
+
+def _image_urls(db: Session, kind: str, entities: list) -> dict[int, str | None]:
+    """Faces for authors and logos for organizations; other kinds have none."""
+    if kind == "author":
+        ids = [author.id for author in entities]
+        photos = {
+            photo.author_id: photo
+            for photo in db.scalars(
+                select(AuthorPhoto).where(AuthorPhoto.author_id.in_(ids))
+            )
+        }
+        return {a.id: author_image_url(a, photos.get(a.id)) for a in entities}
+    if kind == "organization":
+        return {org.id: OrganizationService.logo_url(org) for org in entities}
+    return {}
+
+
+def _entity_url(kind: str, entity) -> str:
+    return f"/{ENTITIES[kind][1]}/{getattr(entity, 'slug', None) or entity.id}"
+
+
+def suggestions(db: Session) -> FollowSuggestions:
+    authors = {
+        a.id: a
+        for a in db.scalars(select(Author).where(Author.id.in_(POPULAR_AUTHOR_IDS)))
+    }
+    ordered_authors = [authors[i] for i in POPULAR_AUTHOR_IDS if i in authors]
+    # The directory's curated order puts the best-known labs first.
+    organizations = db.scalars(
+        select(Organization)
+        .where(Organization.display_order.is_not(None))
+        .order_by(Organization.display_order, Organization.id)
+        .limit(POPULAR_ORGANIZATION_LIMIT)
+    ).all()
+    groups = {}
+    for kind, entities in (
+        ("author", ordered_authors),
+        ("organization", organizations),
+    ):
+        images = _image_urls(db, kind, entities)
+        groups[kind] = [
+            FollowSuggestion(
+                entity_id=entity.id,
+                name=entity.name,
+                url=_entity_url(kind, entity),
+                image_url=images.get(entity.id),
+            )
+            for entity in entities
+        ]
+    return FollowSuggestions(
+        authors=groups["author"], organizations=groups["organization"]
+    )
+
 
 def follows(db: Session, subject: str) -> list[FollowView]:
     rows = db.scalars(
@@ -43,7 +113,7 @@ def follows(db: Session, subject: str) -> list[FollowView]:
         .order_by(ResearchFollow.kind, ResearchFollow.entity_id)
     ).all()
     result = []
-    for kind, (model, route) in ENTITIES.items():
+    for kind, (model, _route) in ENTITIES.items():
         group = [row for row in rows if row.kind == kind]
         entities = (
             {
@@ -55,20 +125,32 @@ def follows(db: Session, subject: str) -> list[FollowView]:
             if group
             else {}
         )
+        images = _image_urls(db, kind, list(entities.values()))
+        parents = _parent_slugs(db, list(entities.values())) if kind == "task" else {}
         for row in group:
             entity = entities.get(row.entity_id)
             if entity:
-                slug = getattr(entity, "slug", None) or entity.id
                 result.append(
                     FollowView(
                         kind=kind,
                         entity_id=row.entity_id,
                         name=entity.name,
-                        url=f"/{route}/{slug}",
+                        url=_entity_url(kind, entity),
                         created_at=row.created_at,
+                        image_url=images.get(entity.id),
+                        parent_slug=parents.get(entity.parent_id)
+                        if kind == "task"
+                        else None,
                     )
                 )
     return result
+
+
+def _parent_slugs(db: Session, tasks: list) -> dict[int, str]:
+    ids = {task.parent_id for task in tasks if task.parent_id}
+    if not ids:
+        return {}
+    return dict(db.execute(select(Task.id, Task.slug).where(Task.id.in_(ids))).all())
 
 
 class Interest(NamedTuple):
@@ -78,15 +160,18 @@ class Interest(NamedTuple):
 
 
 def interests(db: Session, subject: str) -> dict[tuple[str, int], Interest]:
-    """Entity follows plus the account's free-text topic, named as reasons show them."""
+    """Entity follows plus the account's free-text topics, named as reasons show them."""
     found = {
         (f.kind, f.entity_id): Interest(f.kind, f.entity_id, f.name)
         for f in follows(db, subject)
     }
-    sub = db.get(ResearchSubscription, subject)
-    topic = sub and sub.topic_id and db.get(ResearchTopic, sub.topic_id)
-    if topic:
-        short = topic.text if len(topic.text) <= 80 else topic.text[:79].rstrip() + "…"
+    for topic in db.scalars(
+        select(ResearchTopic)
+        .join(ResearchTopicFollow, ResearchTopicFollow.topic_id == ResearchTopic.id)
+        .where(ResearchTopicFollow.hf_subject == subject)
+    ):
+        name = capitalized(topic.label or topic.text)
+        short = name if len(name) <= 80 else name[:79].rstrip() + "…"
         found["topic", topic.id] = Interest("topic", topic.id, f"\u201c{short}\u201d")
     return found
 
@@ -128,6 +213,30 @@ def subscription(db: Session, subject: str) -> ResearchSubscription:
     )
     db.flush()
     return db.get(ResearchSubscription, subject)
+
+
+def default_email_on(
+    db: Session, subject: str, email: str | None, now: datetime
+) -> None:
+    """Turn the weekly email on for an account that follows something and never had it on.
+
+    Opting in sets ``opted_in_at`` and turning the email off keeps it, so an
+    account that switched the email off or unsubscribed is never re-enabled.
+    """
+    sub = subscription(db, subject)
+    db.refresh(sub, with_for_update=True)
+    follows_something = db.scalar(
+        select(exists().where(ResearchFollow.hf_subject == subject))
+    ) or db.scalar(select(exists().where(ResearchTopicFollow.hf_subject == subject)))
+    if (
+        email
+        and not sub.enabled
+        and sub.opted_in_at is None
+        and follows_something
+        and not suppressed(db, email)
+    ):
+        sub.enabled, sub.email, sub.opted_in_at = True, email, now
+    db.commit()
 
 
 def suppressed(db: Session, email: str | None) -> bool:
@@ -196,12 +305,12 @@ def diverse(
 
 # Match associations on every version, display the latest version, and apply the
 # earliest publication date. Recursive UNION (not UNION ALL) tolerates bad cycles.
+# A topic matches its Jev verdicts, plus its embedding preview until the backfill is done.
 MATCH_SQL = """
 WITH RECURSIVE interests AS (
  SELECT kind,entity_id,created_at FROM research_follows WHERE hf_subject=:subject
  UNION ALL
- SELECT 'topic',topic_id,topic_set_at FROM research_subscriptions
- WHERE hf_subject=:subject AND topic_id IS NOT NULL
+ SELECT 'topic',topic_id,created_at FROM research_topic_follows WHERE hf_subject=:subject
 ), descendants(root,id) AS (
  SELECT entity_id,entity_id FROM interests WHERE kind='task'
  UNION SELECT d.root,t.id FROM tasks t JOIN descendants d ON t.parent_id=d.id
@@ -225,6 +334,11 @@ WITH RECURSIVE interests AS (
  SELECT 'topic',i.entity_id,v.paper_id,2 FROM interests i
  JOIN research_topic_verdicts v ON v.topic_id=i.entity_id AND v.score>=:topic_threshold
  WHERE i.kind='topic'
+ UNION ALL
+ SELECT 'topic',i.entity_id,pv.paper_id,2 FROM interests i
+ JOIN research_topics t ON t.id=i.entity_id AND t.backfill_status<>'done'
+ JOIN research_topic_previews pv ON pv.topic_id=t.id
+ WHERE i.kind='topic'
 )
 SELECT DISTINCT h.kind,h.entity_id,h.strength,i.created_at followed_at,
  p.id,p.arxiv_id,p.title,p.abstract,p.tldr,
@@ -238,6 +352,39 @@ JOIN papers p ON (source.arxiv_id IS NOT NULL AND p.arxiv_id=source.arxiv_id AND
 WHERE p.date_published BETWEEN :cutoff AND :today
 AND NOT EXISTS (SELECT 1 FROM papers old WHERE old.arxiv_id=p.arxiv_id AND old.date_published<:cutoff)
 """
+
+
+NEW_COUNT_LIMIT = 100
+
+
+def new_paper_cutoff(now: datetime, since: datetime) -> date:
+    """Earliest publication date a paper added after ``since`` can count as new."""
+    # A paper added after the last visit was published at most a few days before it,
+    # and the feed itself only reaches back 30 days.
+    return max(since - timedelta(days=7), now - timedelta(days=30)).date()
+
+
+def new_paper_count(db: Session, subject: str, now: datetime, since: datetime) -> int:
+    """Following-feed papers added to the catalog after ``since``, capped at NEW_COUNT_LIMIT."""
+    cutoff = new_paper_cutoff(now, since)
+    matches = (
+        text(MATCH_SQL)
+        .bindparams(
+            subject=subject,
+            today=now.date(),
+            cutoff=cutoff,
+            topic_threshold=TOPIC_THRESHOLD,
+        )
+        .columns(column("id", Integer))
+        .subquery("matches")
+    )
+    new_ids = (
+        select(DBPaper.id)
+        .where(DBPaper.id.in_(select(matches.c.id)), DBPaper.created_at > since)
+        .limit(NEW_COUNT_LIMIT)
+        .subquery()
+    )
+    return db.scalar(select(func.count()).select_from(new_ids))
 
 
 def matching_entries(
@@ -373,12 +520,24 @@ def feed_entries(
     has_code: bool = False,
     has_hf_artifacts: bool = False,
     topic_only: bool = False,
+    topic_ids: Sequence[int] = (),
+    follows: Sequence[tuple[str, int]] = (),
+    added_after: datetime | None = None,
 ) -> list[ResearchFeedEntry]:
-    """Filter and rank matches like the home feed, then explain only the returned page."""
+    """Filter and rank matches like the home feed, then explain only the returned page.
+
+    ``added_after`` lists exactly the papers ``new_paper_count`` counts, newest first,
+    in place of the publication-date window.
+    """
     from backend.services.paper_service import PaperService
 
-    cutoff = date.min if all_time else start_date or (now - timedelta(days=30)).date()
-    until = min(end_date or now.date(), now.date())
+    if added_after is not None:
+        cutoff, until = new_paper_cutoff(now, added_after), now.date()
+    else:
+        cutoff = (
+            date.min if all_time else start_date or (now - timedelta(days=30)).date()
+        )
+        until = min(end_date or now.date(), now.date())
     matches = (
         text(MATCH_SQL)
         .bindparams(
@@ -387,11 +546,24 @@ def feed_entries(
             cutoff=cutoff,
             topic_threshold=TOPIC_THRESHOLD,
         )
-        .columns(column("id", Integer), column("kind", String))
+        .columns(
+            column("id", Integer), column("kind", String), column("entity_id", Integer)
+        )
         .subquery("matches")
     )
     matched_ids = select(matches.c.id)
-    if topic_only:
+    # Selected topics and follows combine as either-or, like merging their feeds.
+    selected = [
+        and_(matches.c.kind == kind, matches.c.entity_id == entity_id)
+        for kind, entity_id in follows
+    ]
+    if topic_ids:
+        selected.append(
+            and_(matches.c.kind == "topic", matches.c.entity_id.in_(topic_ids))
+        )
+    if selected:
+        matched_ids = matched_ids.where(or_(*selected))
+    elif topic_only:
         matched_ids = matched_ids.where(matches.c.kind == "topic")
     service = PaperService(db)
     query = db.query(DBPaper).filter(DBPaper.id.in_(matched_ids))
@@ -399,7 +571,13 @@ def feed_entries(
         query = service.apply_has_code_filter(query)
     if has_hf_artifacts:
         query = service.apply_has_hf_artifacts_filter(query)
-    rows = service.apply_scoped_trending_order(query).offset(offset).limit(limit).all()
+    if added_after is not None:
+        query = query.filter(DBPaper.created_at > added_after).order_by(
+            DBPaper.created_at.desc(), DBPaper.id.desc()
+        )
+    else:
+        query = service.apply_scoped_trending_order(query)
+    rows = query.offset(offset).limit(limit).all()
     if not rows:
         return []
     entries = {
@@ -408,6 +586,7 @@ def feed_entries(
             db, subject, now, cutoff=cutoff, until=until, paper_ids=[r.id for r in rows]
         )
     }
+    added_at = {str(row.id): row.created_at for row in rows}
     papers = service.hydrate_cards(rows, include_resources=True)
     return [
         ResearchFeedEntry(
@@ -415,6 +594,7 @@ def feed_entries(
                 f"arxiv:{p.arxiv_id}" if p.arxiv_id else f"paper:{p.id}"
             ].model_dump(),
             paper=p,
+            added_at=added_at[p.id],
         )
         for p in papers
     ]

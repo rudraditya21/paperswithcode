@@ -102,6 +102,8 @@ const newOrganizationPayload = suggestionBase.extend({
 const base = z.object({
   id: z.number(),
   paper_id: z.number().nullable(),
+  /** The edited paper's title and arXiv ID; set on list responses. */
+  paper: z.object({ title: z.string(), arxiv_id: z.string().nullish() }).nullish(),
   hf_username: z.string(),
   hf_subject: z.string().nullish(),
   is_author: z.boolean(),
@@ -214,34 +216,72 @@ const pendingPaperEditSchema = z.discriminatedUnion("edit_type", [
 export type PendingPaperEdit = z.infer<typeof pendingPaperEditSchema>;
 export type PendingEditType = PendingPaperEdit["edit_type"];
 export type PendingEditStatus = PendingPaperEdit["status"];
+export type PendingEditOf<Type extends PendingEditType> = Extract<PendingPaperEdit, { edit_type: Type }>;
+export type NamedItem = z.infer<typeof namedItem>;
+export type UrlItem = z.infer<typeof urlItem>;
+export type EvaluationData = z.infer<typeof evaluationData>;
+export type EvaluationSnapshot = z.infer<typeof evaluationSnapshot>;
+export type PendingEvaluationOperation = z.infer<typeof evaluationOperation>;
 export type PendingPaperEditSubmitPayload = PendingPaperEdit extends infer Edit
   ? Edit extends PendingPaperEdit
     ? Pick<Edit, "paper_id" | "edit_type" | "proposed_payload">
     : never
   : never;
 
-type EditOf<Type extends PendingEditType> = Extract<PendingPaperEdit, { edit_type: Type }>;
-
 export function pendingEditSubmission<Type extends PendingEditType>(
   paperId: number | null,
   editType: Type,
-  proposedPayload: EditOf<Type>["proposed_payload"],
-): Pick<EditOf<Type>, "paper_id" | "edit_type" | "proposed_payload"> {
+  proposedPayload: PendingEditOf<Type>["proposed_payload"],
+): PendingPaperEditSubmitPayload {
   return {
     paper_id: paperId,
     edit_type: editType,
     proposed_payload: proposedPayload,
-  } as Pick<EditOf<Type>, "paper_id" | "edit_type" | "proposed_payload">;
+  } as PendingPaperEditSubmitPayload;
 }
+
+interface EditTypeMeta {
+  /** Filter and pill text on the submissions dashboard. */
+  label: string;
+  /** Approval only records the decision; it changes no catalog data. */
+  administrative: boolean;
+  /** Card heading for suggestions that are not attached to a paper. */
+  directory?: { title: string; subtitle: string };
+}
+
+const suggestion = (title: string, subtitle: string) => ({ directory: { title, subtitle } });
+
+/** Listed in dashboard filter order. */
+export const EDIT_TYPE_META: Record<PendingEditType, EditTypeMeta> = {
+  tasks: { label: "tasks", administrative: false },
+  methods: { label: "methods", administrative: false },
+  evaluations: { label: "evaluations", administrative: false },
+  repositories: { label: "repositories", administrative: false },
+  project_pages: { label: "project pages", administrative: false },
+  source_url: { label: "source url", administrative: false },
+  x_threads: { label: "x threads", administrative: false },
+  hf_artifacts: { label: "hf artifacts", administrative: false },
+  organizations: { label: "organizations", administrative: false },
+  new_task: { label: "new task", administrative: true, ...suggestion("New task", "Task suggestion") },
+  new_method: { label: "new method", administrative: true, ...suggestion("New method", "Method suggestion") },
+  new_benchmark: { label: "new benchmark", administrative: true, ...suggestion("New benchmark", "Benchmark suggestion") },
+  new_metric: { label: "new metric", administrative: true, ...suggestion("New metric", "Metric suggestion") },
+  new_conference: { label: "new conference", administrative: true, ...suggestion("New conference", "Conference suggestion") },
+  new_organization: { label: "new organization", administrative: false, ...suggestion("New organization", "Organization suggestion") },
+  new_external_paper: { label: "external paper", administrative: false, ...suggestion("External paper", "External paper submission") },
+};
 
 export interface PendingPaperEditsResponse {
   count: number;
   results: PendingPaperEdit[];
+  /** Rows per status under the same filters, ignoring the status filter. */
+  status_counts: Record<PendingEditStatus, number>;
 }
 
 const responseSchema = z.object({
   count: z.number(),
   results: z.array(pendingPaperEditSchema),
+  status_counts: z.object({ pending: z.number(), approved: z.number(), rejected: z.number() }),
 });
 
 export class PendingEditPayloadError extends Error {

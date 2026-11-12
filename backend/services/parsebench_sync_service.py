@@ -14,18 +14,22 @@ import httpx
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
-    Dataset,
     Evaluation,
-    Metric,
     Paper,
     PaperTask,
-    Task,
-    TaskDatasetMetric,
 )
 from backend.services.evaluation_service import EvaluationService
 from backend.services.external_resource_service import (
     ExternalResourceInput,
     ExternalResourceService,
+)
+from backend.services.leaderboard_model_matching_service import (
+    LeaderboardModel,
+    LeaderboardModelMatcher,
+    vendor_label_model,
+)
+from backend.services.leaderboard_sync_catalog import (
+    resolve_leaderboard,
 )
 from backend.services.leaderboard_sync_ownership import managed_methodology_prefix
 from backend.services.paper_ingestion_service import PaperIngestionService
@@ -61,6 +65,9 @@ MIN_EXPECTED_ENTRIES = 40
 MAX_EXPECTED_ENTRIES = 400
 # Refuse to replace the managed leaderboard when the reviewed subset collapses.
 MIN_REVIEWED_ENTRIES = 30
+# Categories whose rows are single models ("VLM - Proprietary", "VLM - Open
+# Weight"); parsing products and PDF libraries need a reviewed identity.
+MODEL_CATEGORY_PREFIX = "VLM"
 
 
 @dataclass(frozen=True)
@@ -215,6 +222,12 @@ _LIGHTONOCR_3 = external(
     is_open=True,
 )
 
+_GPT_6_1_TERRA = external(
+    "https://openai.com/index/introducing-gpt-6-1-terra",
+    "Introducing GPT-6.1 Terra",
+    "2026-10-26",
+)
+
 _GPT_6_SOL_LUNA = external(
     "https://openai.com/index/introducing-gpt-6-sol-and-luna/",
     "Introducing GPT-6 Sol and Luna",
@@ -232,6 +245,22 @@ MODEL_PAPER_IDENTITIES: dict[str, PaperIdentity] = {
     "WeVisDoc-2B": arxiv("2609.20423"),
     "WeVisDoc-4B": arxiv("2609.20423"),
     "OpenAI GPT-6.1 Sol (Reasoning Low)": _GPT_6_1_SOL,
+    "OpenAI GPT-6.1 Terra (Reasoning Medium)": _GPT_6_1_TERRA,
+    "OpenAI GPT-6.1 Terra (Reasoning Low)": _GPT_6_1_TERRA,
+    "OvisOCR3": arxiv("2610.33066"),
+    "Unlimited-OCR-2": arxiv("2610.39308"),
+    "Nemotron-3.5-Parse": external(
+        "https://huggingface.co/nvidia/Nemotron-3.5-Parse",
+        "Nemotron 3.5 Parse",
+        "2026-10-17",
+        is_open=True,
+    ),
+    "MiniCPM-OCR 1.0": external(
+        "https://huggingface.co/openbmb/MiniCPM-OCR-1.0",
+        "MiniCPM-OCR 1.0",
+        "2026-10-21",
+        is_open=True,
+    ),
     "Google Gemini 3.7 Flash (Thinking High)": _GEMINI_3_7_FLASH,
     "Google Gemini 3.7 Flash (Thinking Medium)": _GEMINI_3_7_FLASH,
     "Google Gemini 3.7 Flash (Thinking Low)": _GEMINI_3_7_FLASH,
@@ -498,6 +527,8 @@ EXCLUDED_PROVIDERS: frozenset[str] = frozenset(
         "OpenDataLoader",
         "pdf-inspector",
         "MarkItDown",
+        # API snapshot document-parse-260930; Upstage publishes only a changelog.
+        "Upstage Document Parse 2 (Enhanced)",
     }
 )
 
@@ -538,11 +569,24 @@ class ParseBenchSyncStats:
     updated: int = 0
     deleted: int = 0
     excluded: int = 0
+    auto_matched: list[str] = field(default_factory=list)
     unreviewed: list[str] = field(default_factory=list)
     missing_papers: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
+
+
+def _hf_model_url(entry: ParseBenchEntry) -> str | None:
+    return f"https://huggingface.co/{entry.hf_model_id}" if entry.hf_model_id else None
+
+
+def _leaderboard_model(entry: ParseBenchEntry) -> LeaderboardModel:
+    # Open-weight rows name their Hub organization. Proprietary rows take the
+    # lab of a known model family ("GLM-5.3 Flash"), else the vendor the
+    # label leads with ("OpenAI GPT-6.1 Sol (Reasoning Low)").
+    lab = entry.hf_model_id.split("/", 1)[0] if entry.hf_model_id else ""
+    return vendor_label_model(entry.provider, lab)
 
 
 def _score(value: str, *, field_name: str, provider: str) -> float:
@@ -672,35 +716,6 @@ class ParseBenchSyncService:
     def __init__(self, db: Session):
         self.db = db
 
-    def _leaderboard_identity(self) -> tuple[Task, Dataset]:
-        task = self.db.query(Task).filter(Task.slug == TASK_SLUG).one_or_none()
-        dataset = (
-            self.db.query(Dataset).filter(Dataset.slug == DATASET_SLUG).one_or_none()
-        )
-        metric_ids = {
-            metric.name: metric.id
-            for metric in self.db.query(Metric)
-            .filter(Metric.name.in_(METRIC_NAMES))
-            .all()
-        }
-        if task is None or dataset is None:
-            raise RuntimeError("ParseBench task or benchmark is not configured")
-        if set(metric_ids) != set(METRIC_NAMES):
-            raise RuntimeError("ParseBench metrics are not configured")
-        for metric_id in metric_ids.values():
-            configured = (
-                self.db.query(TaskDatasetMetric)
-                .filter(
-                    TaskDatasetMetric.task_id == task.id,
-                    TaskDatasetMetric.dataset_id == dataset.id,
-                    TaskDatasetMetric.metric_id == metric_id,
-                )
-                .one_or_none()
-            )
-            if configured is None:
-                raise RuntimeError("ParseBench metrics are not linked to the task")
-        return task, dataset
-
     def sync(
         self,
         entries: list[ParseBenchEntry],
@@ -712,7 +727,9 @@ class ParseBenchSyncService:
             raise ValueError("Refusing to synchronize an empty ParseBench leaderboard")
         stats = ParseBenchSyncStats(fetched=len(entries))
         try:
-            task, dataset = self._leaderboard_identity()
+            task, dataset = resolve_leaderboard(
+                self.db, "ParseBench", TASK_SLUG, DATASET_SLUG, METRIC_NAMES
+            )
             managed_rows = (
                 self.db.query(Evaluation)
                 .filter(
@@ -734,11 +751,14 @@ class ParseBenchSyncService:
                 .all()
             }
             reviewed: list[ParseBenchEntry] = []
+            new_models: list[ParseBenchEntry] = []
             for entry in entries:
                 if entry.provider in MODEL_PAPER_IDENTITIES:
                     reviewed.append(entry)
                 elif entry.provider in EXCLUDED_PROVIDERS:
                     stats.excluded += 1
+                elif entry.category.startswith(MODEL_CATEGORY_PREFIX):
+                    new_models.append(entry)
                 else:
                     stats.unreviewed.append(entry.provider)
             if len(reviewed) < MIN_REVIEWED_ENTRIES:
@@ -746,9 +766,17 @@ class ParseBenchSyncService:
                     f"ParseBench has only {len(reviewed)} reviewed rows; refusing "
                     "to replace the managed leaderboard"
                 )
-
-            now = datetime.now(UTC)
-            published: set[str] = set()
+            # New single-model rows are matched to an indexed paper; the rest
+            # become release-radar signals and match on a later run.
+            matcher = LeaderboardModelMatcher(
+                self.db,
+                provider="parsebench",
+                leaderboard_name="ParseBench",
+                leaderboard_url=PARSEBENCH_SOURCE_URL,
+            )
+            matched = matcher.match([_leaderboard_model(e) for e in new_models])
+            # (entry, paper id, is_open, HF model URL)
+            publishable: list[tuple[ParseBenchEntry, int, bool, str | None]] = []
             for entry in reviewed:
                 identity = MODEL_PAPER_IDENTITIES[entry.provider]
                 paper_id = discovery.papers.get(identity.key)
@@ -759,6 +787,34 @@ class ParseBenchSyncService:
                         )
                     stats.missing_papers.append(entry.provider)
                     continue
+                publishable.append(
+                    (entry, paper_id, identity.is_open, _hf_model_url(entry))
+                )
+            for entry in new_models:
+                if (match := matched.get(_leaderboard_model(entry).name)) is None:
+                    stats.unreviewed.append(entry.provider)
+                    continue
+                # A published Hub checkpoint makes the row open-weight.
+                publishable.append(
+                    (
+                        entry,
+                        match.paper_id,
+                        entry.hf_model_id is not None or match.is_open,
+                        _hf_model_url(entry) or match.hf_model_url,
+                    )
+                )
+                stats.auto_matched.append(entry.provider)
+            matcher.report_unmatched(
+                [
+                    _leaderboard_model(e)
+                    for e in new_models
+                    if _leaderboard_model(e).name not in matched
+                ]
+            )
+
+            now = datetime.now(UTC)
+            published: set[str] = set()
+            for entry, paper_id, is_open, hf_model_url in publishable:
                 row = managed.get(entry.provider)
                 if row is None:
                     row = Evaluation(
@@ -774,17 +830,13 @@ class ParseBenchSyncService:
                 row.methodology = _methodology(entry)
                 row.metrics = entry.metrics
                 row.uses_additional_data = False
-                row.is_open = identity.is_open
+                row.is_open = is_open
                 row.best_metric = PRIMARY_METRIC_NAME
                 row.evaluated_on = now.date()
                 row.external_source_url = PARSEBENCH_SOURCE_URL
                 row.source_url = PARSEBENCH_SOURCE_URL
                 row.external = True
-                row.hf_model_url = (
-                    f"https://huggingface.co/{entry.hf_model_id}"
-                    if entry.hf_model_id
-                    else None
-                )
+                row.hf_model_url = hf_model_url
                 row.updated_at = now
                 if paper_id not in linked_paper_ids:
                     self.db.add(

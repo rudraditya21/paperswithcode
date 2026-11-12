@@ -15,8 +15,14 @@ from backend.models.database import (
     Base,
     Dataset,
     Evaluation,
+    HfArtifact,
     Metric,
+    ModelProviderAlias,
+    ModelRelease,
+    ModelReleaseArtifact,
+    ModelReleaseSignal,
     Paper,
+    PaperHfArtifact,
     PaperTask,
     Task,
     TaskDataset,
@@ -37,6 +43,7 @@ from backend.services.parsebench_sync_service import (
     fetch_parsebench_leaderboard,
     parse_parsebench_leaderboard,
 )
+from backend.tests.evaluation.model_evidence import add_release_evidence
 
 
 @compiles(BigInteger, "sqlite")
@@ -58,9 +65,16 @@ HEADER = (
 )
 
 
-def _row(provider: str, overall: float, *, hf: str = "", cost: str = "") -> str:
+def _row(
+    provider: str,
+    overall: float,
+    *,
+    hf: str = "",
+    cost: str = "",
+    category: str = "VLM - Open Weight",
+) -> str:
     return (
-        f"{provider},VLM - Open Weight,{overall},{overall + 1},{overall - 1},"
+        f"{provider},{category},{overall},{overall + 1},{overall - 1},"
         f"{overall},{overall},{overall},{cost},,,,,{hf}\n"
     )
 
@@ -97,6 +111,12 @@ def _session() -> Session:
             TaskDatasetMetric.__table__,
             Evaluation.__table__,
             PaperTask.__table__,
+            HfArtifact.__table__,
+            PaperHfArtifact.__table__,
+            ModelRelease.__table__,
+            ModelReleaseArtifact.__table__,
+            ModelProviderAlias.__table__,
+            ModelReleaseSignal.__table__,
         ],
     )
     session = Session(engine)
@@ -236,6 +256,7 @@ def test_sync_upserts_managed_rows_and_preserves_manual_rows(monkeypatch):
         "updated": 1,
         "deleted": 1,
         "excluded": 1,
+        "auto_matched": [],
         "unreviewed": ["Brand New Product"],
         "missing_papers": [],
     }
@@ -262,6 +283,48 @@ def test_sync_upserts_managed_rows_and_preserves_manual_rows(monkeypatch):
     assert second.updated == 39
     assert second.deleted == 0
     assert session.query(Evaluation).count() == 40
+
+
+def test_unknown_models_match_announcements_or_become_radar_signals(monkeypatch):
+    session = _session()
+    monkeypatch.setattr(pb, "MODEL_PAPER_IDENTITIES", _identities())
+    session.add(
+        Paper(
+            id=2000,
+            title="NovaOCR-3: Reading Every Page",
+            source="external",
+            source_url="https://example.com/novaocr-3",
+            version="v1",
+            is_latest_version=True,
+        )
+    )
+    add_release_evidence(session, 2000)
+    session.commit()
+    entries = parse_parsebench_leaderboard(
+        _csv()
+        + _row("NovaOCR-3", 81, hf="nova-lab/NovaOCR-3")
+        + _row("Ear-OCR-2", 77, hf="ear-lab/Ear-OCR-2")
+        + _row("Anthropic Opus 9", 79, category="VLM - Proprietary")
+        + _row("Acme Parse", 83, category="Commercial - Startup APIs")
+    )
+
+    first = ParseBenchSyncService(session).sync(entries, discovery=_discovery())
+    second = ParseBenchSyncService(session).sync(entries, discovery=_discovery())
+
+    assert first.auto_matched == second.auto_matched == ["NovaOCR-3"]
+    assert first.unreviewed == ["Acme Parse", "Ear-OCR-2", "Anthropic Opus 9"]
+    assert (first.created, second.created, second.updated) == (41, 0, 41)
+    row = session.query(Evaluation).filter(Evaluation.paper_id == 2000).one()
+    assert (row.model_name, row.metrics[PRIMARY_METRIC_NAME]) == ("NovaOCR-3", 81)
+    assert row.is_open is True
+    assert row.hf_model_url == "https://huggingface.co/nova-lab/NovaOCR-3"
+    assert session.query(PaperTask).filter(PaperTask.paper_id == 2000).count() == 1
+    # Products never become release signals; unmatched models do.
+    signals = {
+        signal.model_name: signal.lab
+        for signal in session.query(ModelReleaseSignal).all()
+    }
+    assert signals == {"Ear-OCR-2": "ear-lab", "Opus 9": "Anthropic"}
 
 
 def test_sync_refuses_when_reviewed_coverage_collapses(monkeypatch):
@@ -339,3 +402,29 @@ def test_discovery_reuses_existing_and_indexes_missing_external_papers(monkeypat
     assert result.papers["https://example.com/model-0"] == 1000
     assert result.papers["https://example.com/new"]
     assert result.indexed_papers == ["https://example.com/new"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "key"),
+    [
+        (
+            "OpenAI GPT-6.1 Terra (Reasoning Medium)",
+            "https://openai.com/index/introducing-gpt-6-1-terra",
+        ),
+        (
+            "OpenAI GPT-6.1 Terra (Reasoning Low)",
+            "https://openai.com/index/introducing-gpt-6-1-terra",
+        ),
+        ("OvisOCR3", "2610.33066"),
+        ("Unlimited-OCR-2", "2610.39308"),
+        ("Nemotron-3.5-Parse", "https://huggingface.co/nvidia/Nemotron-3.5-Parse"),
+        ("MiniCPM-OCR 1.0", "https://huggingface.co/openbmb/MiniCPM-OCR-1.0"),
+    ],
+)
+def test_new_upstream_providers_resolve_to_their_release(provider, key):
+    assert MODEL_PAPER_IDENTITIES[provider].key == key
+    assert provider not in EXCLUDED_PROVIDERS
+
+
+def test_upstage_api_snapshot_is_a_reviewed_exclusion():
+    assert "Upstage Document Parse 2 (Enhanced)" in EXCLUDED_PROVIDERS

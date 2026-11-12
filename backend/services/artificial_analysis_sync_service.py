@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import math
-import re
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
@@ -14,20 +14,19 @@ import httpx
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
-    Dataset,
     Evaluation,
-    Metric,
     ModelProviderAlias,
     ModelRelease,
     Paper,
     PaperTask,
-    Task,
-    TaskDatasetMetric,
 )
 from backend.services.evaluation_service import EvaluationService
 from backend.services.external_resource_service import (
     ExternalResourceInput,
     ExternalResourceService,
+)
+from backend.services.leaderboard_sync_catalog import (
+    resolve_leaderboard,
 )
 from backend.services.leaderboard_sync_ownership import managed_methodology_prefix
 from backend.services.model_release_identity_service import ModelReleaseIdentityService
@@ -272,6 +271,8 @@ class ArtificialAnalysisLeaderboard:
     quota_limit: str | None = None
     # Reviewed slugs Artificial Analysis no longer lists.
     missing_reviewed: list[str] = field(default_factory=list)
+    # Indexes with no scores at all; their rows are kept until scores return.
+    withdrawn_indexes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -344,7 +345,9 @@ def _parse_score(raw_score: Any, *, slug: str, index: ArtificialAnalysisIndex) -
     return score
 
 
-def _parse_page(payload: Any) -> tuple[str, list[ArtificialAnalysisEntry], dict]:
+def _parse_page(
+    payload: Any,
+) -> tuple[str, list[ArtificialAnalysisEntry], dict, set[str]]:
     if not isinstance(payload, dict):
         raise TypeError("Artificial Analysis response must be a JSON object")
     version = payload.get("intelligence_index_version")
@@ -359,10 +362,13 @@ def _parse_page(payload: Any) -> tuple[str, list[ArtificialAnalysisEntry], dict]
         raise TypeError("Artificial Analysis response has invalid pagination or data")
 
     entries: list[ArtificialAnalysisEntry] = []
+    listed: set[str] = set()
     for row in rows:
         if not isinstance(row, dict):
             raise TypeError("Artificial Analysis model rows must be objects")
         slug = row.get("slug")
+        if isinstance(slug, str):
+            listed.add(slug)
         name = row.get("name")
         evaluations = row.get("evaluations")
         scores: dict[str, float] = {}
@@ -392,7 +398,7 @@ def _parse_page(payload: Any) -> tuple[str, list[ArtificialAnalysisEntry], dict]
                 f"Artificial Analysis release date is invalid for {slug}"
             ) from exc
         entries.append(ArtificialAnalysisEntry(slug, name, scores, released))
-    return version, entries, pagination
+    return version, entries, pagination, listed
 
 
 def fetch_artificial_analysis_leaderboard(
@@ -409,6 +415,7 @@ def fetch_artificial_analysis_leaderboard(
     )
     try:
         all_entries: list[ArtificialAnalysisEntry] = []
+        listed_slugs: set[str] = set()
         version: str | None = None
         page = 1
         while True:
@@ -420,13 +427,14 @@ def fetch_artificial_analysis_leaderboard(
             response.raise_for_status()
             quota_remaining = response.headers.get("x-ratelimit-remaining")
             quota_limit = response.headers.get("x-ratelimit-limit")
-            page_version, entries, pagination = _parse_page(response.json())
+            page_version, entries, pagination, listed = _parse_page(response.json())
             if version is not None and page_version != version:
                 raise ValueError(
                     "Artificial Analysis index version changed during fetch"
                 )
             version = page_version
             all_entries.extend(entries)
+            listed_slugs |= listed
             has_more = pagination.get("has_more")
             total_pages = pagination.get("total_pages")
             if not isinstance(has_more, bool) or not isinstance(total_pages, int):
@@ -453,15 +461,20 @@ def fetch_artificial_analysis_leaderboard(
             )
         unique_entries[entry.slug] = entry
     all_entries = list(unique_entries.values())
-    slugs = list(unique_entries)
-    missing = sorted(set(MODEL_PAPER_IDENTITIES) - set(slugs))
+    # Listed-but-unscored models (deprecated or awaiting re-scoring) are present.
+    missing = sorted(set(MODEL_PAPER_IDENTITIES) - listed_slugs)
     # A few withdrawn models are normal; a large gap means a broken response.
     if len(missing) > len(MODEL_PAPER_IDENTITIES) // MAX_MISSING_REVIEWED_DIVISOR:
         raise ValueError(
             "Artificial Analysis is missing reviewed models: " + ",".join(missing)
         )
+    withdrawn: list[str] = []
     for index in INDEXES:
         scored = [entry.slug for entry in all_entries if index.key in entry.scores]
+        if not scored:
+            # Artificial Analysis cleared the whole index (Agentic, 2026-10-29).
+            withdrawn.append(index.key)
+            continue
         if not index.min_expected_models <= len(scored) <= index.max_expected_models:
             raise ValueError(
                 f"Artificial Analysis {index.label} returned {len(scored)} scored "
@@ -473,6 +486,7 @@ def fetch_artificial_analysis_leaderboard(
         quota_remaining=quota_remaining,
         quota_limit=quota_limit,
         missing_reviewed=missing,
+        withdrawn_indexes=withdrawn,
     )
 
 
@@ -547,6 +561,19 @@ class ArtificialAnalysisPaperDiscoveryService:
                     if entry.slug not in result.papers
                 ],
             )
+            # Frontier API models have no Hub repo or release row, only the
+            # lab's launch page in the catalog.
+            resolved_releases.update(
+                identity_service.bind_release_pages(
+                    "artificial-analysis",
+                    [
+                        (entry.slug, entry.name)
+                        for entry in leaderboard.entries
+                        if entry.slug not in result.papers
+                        and entry.slug not in resolved_releases
+                    ],
+                )
+            )
             for entry in leaderboard.entries:
                 if entry.slug in result.papers:
                     continue
@@ -567,35 +594,6 @@ def _stale_index_version(
 class ArtificialAnalysisSyncService:
     def __init__(self, db: Session):
         self.db = db
-
-    def _leaderboard_identity(
-        self, index: ArtificialAnalysisIndex
-    ) -> tuple[Task, Dataset]:
-        task = self.db.query(Task).filter(Task.slug == index.task_slug).one_or_none()
-        dataset = (
-            self.db.query(Dataset)
-            .filter(Dataset.slug == index.dataset_slug)
-            .one_or_none()
-        )
-        metric = self.db.query(Metric).filter(Metric.name == METRIC_NAME).one_or_none()
-        if task is None or dataset is None or metric is None:
-            raise RuntimeError(
-                f"Artificial Analysis {index.label} leaderboard is not configured"
-            )
-        configured = (
-            self.db.query(TaskDatasetMetric)
-            .filter(
-                TaskDatasetMetric.task_id == task.id,
-                TaskDatasetMetric.dataset_id == dataset.id,
-                TaskDatasetMetric.metric_id == metric.id,
-            )
-            .one_or_none()
-        )
-        if configured is None:
-            raise RuntimeError(
-                f"Artificial Analysis {index.label} metric is not linked to the task"
-            )
-        return task, dataset
 
     def _sync_index(
         self,
@@ -629,7 +627,13 @@ class ArtificialAnalysisSyncService:
             ),
             selected=len(selected),
         )
-        task, dataset = self._leaderboard_identity(index)
+        task, dataset = resolve_leaderboard(
+            self.db,
+            f"Artificial Analysis {index.label}",
+            index.task_slug,
+            index.dataset_slug,
+            (METRIC_NAME,),
+        )
         candidate_rows = (
             self.db.query(Evaluation)
             .filter(
@@ -783,6 +787,8 @@ class ArtificialAnalysisSyncService:
         )
         try:
             for index in INDEXES:
+                if index.key in leaderboard.withdrawn_indexes:
+                    continue
                 index_stats = self._sync_index(
                     index,
                     leaderboard,

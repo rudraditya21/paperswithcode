@@ -8,6 +8,7 @@ import {
   ChatStreamError,
   ChatTransportError,
 } from "@/lib/chat";
+import { chatApi } from "@/lib/api/chat";
 import type { ChatSessionDetail } from "@/lib/chatSessions";
 import { useChat } from "@/hooks/useChat";
 
@@ -28,10 +29,6 @@ vi.mock("@/lib/chat", async (importOriginal) => {
   };
 });
 
-vi.mock("@/lib/chatSessions", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/chatSessions")>();
-  return { ...actual, getSession: getSessionMock };
-});
 
 const sessionDetail = (
   id: string,
@@ -138,6 +135,7 @@ beforeEach(() => {
   streamChatMock.mockReset();
   resumeChatMock.mockReset();
   getSessionMock.mockReset();
+  vi.spyOn(chatApi, "getSession").mockImplementation((id) => getSessionMock(id));
   reportChatLatencyMock.mockReset();
 });
 
@@ -1002,18 +1000,16 @@ describe("useChat workspace status and browser timing", () => {
     await act(async () => { await Promise.resolve(); });
 
     act(() => vi.advanceTimersByTime(749));
-    expect(result.current.messages.at(-1)?.status).toBeUndefined();
+    expect(result.current.messages.at(-1)?.progress).toBeUndefined();
     act(() => vi.advanceTimersByTime(1));
-    expect(result.current.messages.at(-1)?.status).toBe(
-      "Preparing research workspace…",
-    );
+    expect(result.current.messages.at(-1)?.progress).toBe("workspace");
 
     await act(async () => {
       workspaceReady.resolve();
       await workspaceReady.promise;
       await Promise.resolve();
     });
-    expect(result.current.messages.at(-1)?.status).toBeUndefined();
+    expect(result.current.messages.at(-1)?.progress).toBeUndefined();
 
     await act(async () => {
       finish.resolve();
@@ -1038,7 +1034,7 @@ describe("useChat workspace status and browser timing", () => {
     });
     await act(async () => { await Promise.resolve(); });
     act(() => vi.advanceTimersByTime(1_000));
-    expect(result.current.messages.at(-1)?.status).toBeUndefined();
+    expect(result.current.messages.at(-1)?.progress).toBeUndefined();
 
     await act(async () => {
       finish.resolve();
@@ -1065,7 +1061,7 @@ describe("useChat workspace status and browser timing", () => {
     await act(async () => { await Promise.resolve(); });
     act(() => vi.advanceTimersByTime(750));
 
-    expect(result.current.messages.at(-1)?.status).toBeUndefined();
+    expect(result.current.messages.at(-1)?.progress).toBeUndefined();
     expect(result.current.messages.at(-1)?.blocks?.[0]).toMatchObject({
       kind: "reasoning",
       active: true,

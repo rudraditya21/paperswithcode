@@ -1,13 +1,14 @@
-import React, { useEffect, useMemo } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import React, { useMemo } from "react";
+import { Link } from "react-router-dom";
 
-import { PaperCard } from "@/components";
-import { PaperFeedFilters } from "@/components/PaperFeedFilters";
+import { PaperFeedList, PaperFeedToolbar } from "@/components/PaperFeed";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Skeleton } from "@/components/ui/skeleton";
-import { useIntersectionObserver } from "@/hooks/useIntersectionObserver";
-import { useInfinitePapers } from "@/hooks/usePapers";
-import { DEFAULT_SITE_SUFFIX, formatPageTitle } from "@/lib/latexPlainText";
+import { usePaperFeedParams } from "@/hooks/usePaperFeedParams";
+import { usePaperFeedQuery } from "@/hooks/usePapers";
+import { papersApi } from "@/lib/api/papers";
+import { formatPageTitle } from "@/lib/latexPlainText";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { paperFeedKeys } from "@/lib/api/queries";
 import { transformPaperForCard } from "@/lib/transform";
 
 import "@/views/AstraForRoboticsView.css";
@@ -19,13 +20,6 @@ import "@/views/AstraForRoboticsView.css";
 const TASK_SLUG = "robotics";
 const METHOD_SLUG = "gpt-6-astra";
 const FRAMING_SOURCE_URL = "https://x.com/YuXiang_IRVL/status/2100395131924840570";
-
-type OrderBy = "trending" | "date_published" | "citation_count";
-const SORT_OPTIONS: Array<[OrderBy, string]> = [
-  ["trending", "trending"],
-  ["date_published", "newest"],
-  ["citation_count", "most cited"],
-];
 
 type XPost = { handle: string; author: string; summary: string; url: string };
 
@@ -138,41 +132,15 @@ const XPostList: React.FC<{ posts: readonly XPost[]; label: string }> = ({ posts
   </div>
 );
 
-const parseOrderBy = (value: string | null): OrderBy =>
-  value === "date_published" || value === "citation_count" ? value : "trending";
-
 const AstraForRoboticsView: React.FC = () => {
-  const [searchParams, setSearchParams] = useSearchParams();
-  const orderBy = parseOrderBy(searchParams.get("order_by"));
-  const hasCode = searchParams.get("has_code") === "true";
-  const hasHfArtifacts = searchParams.get("has_hf_artifacts") === "true";
+  const feed = usePaperFeedParams();
+  const papersQ = usePaperFeedQuery(
+    paperFeedKeys.list({ task: TASK_SLUG, method: METHOD_SLUG, ...feed.filters }),
+    (page) =>
+      papersApi.list({ ...feed.filters, task: TASK_SLUG, method: METHOD_SLUG, page, page_size: 12 }),
+  );
 
-  const papersQ = useInfinitePapers({
-    task: TASK_SLUG,
-    method: METHOD_SLUG,
-    page_size: 12,
-    order_by: orderBy,
-    order_dir: "desc",
-    include_resources: true,
-    has_code: hasCode,
-    has_hf_artifacts: hasHfArtifacts,
-  });
-  const { targetRef, isIntersecting } = useIntersectionObserver({
-    rootMargin: "200px",
-  });
-
-  useEffect(() => {
-    document.title = formatPageTitle("GPT-6 Astra for Robotics");
-    return () => {
-      document.title = DEFAULT_SITE_SUFFIX;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (isIntersecting && papersQ.hasNextPage && !papersQ.isFetchingNextPage) {
-      papersQ.fetchNextPage();
-    }
-  }, [isIntersecting, papersQ.hasNextPage, papersQ.isFetchingNextPage]); // eslint-disable-line react-hooks/exhaustive-deps
+  useDocumentTitle(formatPageTitle("GPT-6 Astra for Robotics"));
 
   const cards = useMemo(
     () =>
@@ -182,13 +150,6 @@ const AstraForRoboticsView: React.FC = () => {
     [papersQ.data],
   );
   const totalCount = papersQ.data?.pages[0]?.count ?? 0;
-
-  const updateParam = (key: string, value: string | null) => {
-    const updated = new URLSearchParams(searchParams);
-    if (value === null) updated.delete(key);
-    else updated.set(key, value);
-    setSearchParams(updated);
-  };
 
   return (
     <div className="page">
@@ -261,32 +222,7 @@ const AstraForRoboticsView: React.FC = () => {
         </div>
       </div>
 
-      <div className="sort-bar">
-        <div className="paper-feed-toolbar-controls">
-          <div className="sort-options">
-            {SORT_OPTIONS.map(([value, label]) => (
-              <button
-                type="button"
-                key={value}
-                className={`sort-btn ${orderBy === value ? "active" : ""}`}
-                onClick={() =>
-                  updateParam("order_by", value === "trending" ? null : value)
-                }
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          <PaperFeedFilters
-            hasCode={hasCode}
-            hasHfArtifacts={hasHfArtifacts}
-            onHasCodeChange={(active) => updateParam("has_code", active ? "true" : null)}
-            onHasHfArtifactsChange={(active) =>
-              updateParam("has_hf_artifacts", active ? "true" : null)
-            }
-          />
-        </div>
-      </div>
+      <PaperFeedToolbar feed={feed} showDateFilter={false} />
 
       {papersQ.error ? (
         <Alert variant="destructive">
@@ -294,28 +230,8 @@ const AstraForRoboticsView: React.FC = () => {
             Failed to load the collection. Please try again.
           </AlertDescription>
         </Alert>
-      ) : papersQ.isLoading ? (
-        <div className="paper-list">
-          {Array.from({ length: 3 }).map((_, index) => (
-            <Skeleton key={index} className="h-40 w-full" />
-          ))}
-        </div>
-      ) : cards.length === 0 ? (
-        <div className="no-results">No papers match this selection yet.</div>
       ) : (
-        <>
-          <div className="paper-list">
-            {cards.map((paper, index) => (
-              <PaperCard key={paper.id} paper={paper} rank={index + 1} />
-            ))}
-          </div>
-          <div ref={targetRef} style={{ height: 1 }} />
-          {papersQ.isFetchingNextPage && (
-            <div style={{ padding: "20px 0", textAlign: "center", color: "var(--ink-faint)" }}>
-              Loading more…
-            </div>
-          )}
-        </>
+        <PaperFeedList query={papersQ} cards={cards} empty="No papers match this selection yet." />
       )}
     </div>
   );

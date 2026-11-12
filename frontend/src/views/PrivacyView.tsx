@@ -1,14 +1,10 @@
 import React from "react";
 
-import { DEFAULT_SITE_SUFFIX, formatPageTitle } from "@/lib/latexPlainText";
+import { formatPageTitle } from "@/lib/latexPlainText";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 
 const PrivacyView: React.FC = () => {
-  React.useEffect(() => {
-    document.title = formatPageTitle("Privacy Policy");
-    return () => {
-      document.title = DEFAULT_SITE_SUFFIX;
-    };
-  }, []);
+  useDocumentTitle(formatPageTitle("Privacy Policy"));
 
   return (
     <article className="page legal-page">
@@ -48,6 +44,14 @@ const PrivacyView: React.FC = () => {
             and feedback about answers. Chats are private to your account unless you
             choose to create a share link; anyone with that link may be able to view the
             shared chat.
+          </li>
+          <li>
+            <strong>Voice input.</strong> If you dictate into the research assistant,
+            your microphone audio is streamed to a speech-recognition model to produce
+            text in your message box. Papers With Code does not store the audio or a
+            separate transcript; the text becomes research assistant content only if
+            you send it. We keep the length and time of each voice session to enforce
+            usage limits.
           </li>
           <li>
             <strong>Provider and billing information.</strong> If you enable a model
@@ -105,6 +109,12 @@ const PrivacyView: React.FC = () => {
             authentication, analytics, observability, security, and support. These include
             Hugging Face services, Langfuse for research-assistant tracing, Plausible for
             website analytics, and infrastructure providers.
+          </li>
+          <li>
+            <strong>Speech recognition.</strong> Voice input audio is transcribed by a
+            model hosted on Hugging Face Inference Endpoints. While that model is starting
+            up or at capacity, the audio is transcribed by OpenAI instead. Neither audio
+            nor transcripts are retained by Papers With Code.
           </li>
           <li>
             <strong>Model providers.</strong> Research-assistant content is sent to the

@@ -1,16 +1,17 @@
+import { EyeOff } from "lucide-react";
 import { Link } from "react-router-dom";
 
-import { Icon } from "@/components";
+import { Icon } from "@/components/Icon";
 import ClosedSourceEvalBadge from "@/components/ClosedSourceEvalBadge";
 import ExternalSourceEvalBadge from "@/components/ExternalSourceEvalBadge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { resultsTaskAnchorId, resultsTaskHash } from "@/hooks/usePaperDetailPageModel";
 import type { Evaluation } from "@/lib/api/evaluations.types";
 import type { Paper } from "@/lib/api/papers.types";
-import { isCodexAddEvalsEnabled } from "@/lib/codexAddEvals";
+import { isCodexAddEvalsEnabled } from "@/lib/apiUrl";
 import { formatMetricValue } from "@/lib/utils";
 
-import { CodexAddEvalsDialog } from "./CodexAddEvalsDialog";
+import { CodexPaperJobDialog } from "./CodexPaperJobDialog";
 import { PaperSectionRule } from "./PaperSectionRule";
 
 export interface EvaluationTaskGroup {
@@ -20,15 +21,55 @@ export interface EvaluationTaskGroup {
   rows: Evaluation[];
 }
 
+export const CLOSED_SOURCE_SETTING_HREF = "/settings#closed-source-evals";
+
+function HiddenClosedSourceEvalsNotice({
+  count,
+  everyResultHidden,
+  onShow,
+}: {
+  count: number;
+  everyResultHidden: boolean;
+  onShow: () => void;
+}) {
+  const results = count === 1 ? "result" : "results";
+  return (
+    <div className="hidden-evals-notice" role="note">
+      <EyeOff className="hidden-evals-notice-icon" aria-hidden="true" />
+      <div className="hidden-evals-notice-body">
+        <p className="hidden-evals-notice-title">
+          {everyResultHidden
+            ? `No evals shown for this paper: all ${count} ${results} are from closed-source models.`
+            : `${count} closed-source ${results} hidden.`}
+        </p>
+        <p className="hidden-evals-notice-desc">
+          You turned on <strong>Hide closed-source models</strong> in your settings.
+          Turn it off to see closed-source results here and on every leaderboard.
+        </p>
+        <div className="hidden-evals-notice-actions">
+          <button type="button" className="hidden-evals-notice-show" onClick={onShow}>
+            Show closed-source results
+          </button>
+          <Link to={CLOSED_SOURCE_SETTING_HREF} className="hidden-evals-notice-link">
+            Change in Settings →
+          </Link>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function PaperResultsSection({
   canCopyBadge,
   canEdit,
   evaluationsByTask,
   evaluationsLoading,
+  hiddenClosedSourceCount,
   isAdmin,
   onCopyBadge,
   onEdit,
   onRefresh,
+  onShowClosedSourceEvals,
   paper,
   visibleEvaluationCount,
 }: {
@@ -36,10 +77,12 @@ export function PaperResultsSection({
   canEdit: boolean;
   evaluationsByTask: EvaluationTaskGroup[];
   evaluationsLoading: boolean;
+  hiddenClosedSourceCount: number;
   isAdmin: boolean;
   onCopyBadge: () => void;
   onEdit: () => void;
   onRefresh: () => void;
+  onShowClosedSourceEvals: () => void;
   paper: Paper;
   visibleEvaluationCount: number;
 }) {
@@ -62,7 +105,9 @@ export function PaperResultsSection({
               </button>
             )}
             {isAdmin && isCodexAddEvalsEnabled() && (
-              <CodexAddEvalsDialog
+              <CodexPaperJobDialog
+                kind="add-evals"
+                triggerClassName="edit-link"
                 paperId={Number(paper.id)}
                 paperTitle={paper.title}
                 onComplete={onRefresh}
@@ -76,6 +121,13 @@ export function PaperResultsSection({
           </span>
         }
       />
+      {!evaluationsLoading && hiddenClosedSourceCount > 0 && (
+        <HiddenClosedSourceEvalsNotice
+          count={hiddenClosedSourceCount}
+          everyResultHidden={evaluationsByTask.length === 0}
+          onShow={onShowClosedSourceEvals}
+        />
+      )}
       {evaluationsLoading ? (
         <Skeleton className="h-32 w-full" />
       ) : evaluationsByTask.length > 0 ? (
@@ -171,7 +223,7 @@ export function PaperResultsSection({
             </table>
           </div>
         ))
-      ) : (
+      ) : hiddenClosedSourceCount > 0 ? null : (
         <p style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--ink-faint)" }}>
           No benchmark results recorded yet.
         </p>

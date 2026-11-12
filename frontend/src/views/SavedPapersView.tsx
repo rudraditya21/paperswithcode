@@ -1,4 +1,4 @@
-import { paperQueryKeys } from "@/lib/paperQueryKeys";
+
 /**
  * Saved papers view (`/saved`).
  *
@@ -14,12 +14,12 @@ import React from "react";
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
-import { PaperCard, TagChip } from "@/components";
+import { PaperCard } from "@/components/PaperCard";
+import { TagChip } from "@/components/Chips";
 import HfSignInButton from "@/components/HfSignInButton";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { accountApi } from "@/lib/api/account";
-import type { SavedPapersResponse } from "@/lib/api/account.types";
+import { paperQueries } from "@/lib/api/queries";
 import { ApiError } from "@/lib/apiTransport";
 import { transformPaperForCard } from "@/lib/transform";
 import { useAuth } from "@/lib/authContext";
@@ -28,13 +28,7 @@ import { savedPapersAuthorizationUrl } from "@/lib/savedPapersAuth";
 const SavedPapersView: React.FC = () => {
   const { user, isLoading: isAuthLoading } = useAuth();
 
-  const query = useQuery<SavedPapersResponse, Error>({
-    queryKey: [...paperQueryKeys.feeds.saved],
-    queryFn: () => accountApi.getBookmarks(),
-    enabled: !!user,
-    staleTime: 30 * 1000,
-    refetchOnWindowFocus: false,
-  });
+  const query = useQuery({ ...paperQueries.saved(), enabled: !!user, staleTime: 30 * 1000 });
   const bucketAuthorizationRequired =
     query.error instanceof ApiError &&
     query.error.code === "saved_papers_bucket_authorization_required";
@@ -72,6 +66,9 @@ const SavedPapersView: React.FC = () => {
       </div>
     );
   }
+
+  // Position across all task groups, so only the first cards on the page load eagerly.
+  let cardPosition = 0;
 
   return (
     <div className="page">
@@ -117,7 +114,18 @@ const SavedPapersView: React.FC = () => {
         </Alert>
       ) : null}
 
-      {showBucketMigration ? (
+      {showBucketMigration && query.data.bucket_migrated ? (
+        <div className="saved-bucket-migration">
+          <p>
+            Your saved papers are already in your private Hugging Face Bucket.
+            Reconnect it in this browser to read from it and save new papers
+            there.
+          </p>
+          <button type="button" className="hf-signin-btn" onClick={authorizeBucket}>
+            Reconnect Hugging Face Bucket
+          </button>
+        </div>
+      ) : showBucketMigration ? (
         <div className="saved-bucket-migration">
           <p>
             {query.data.count
@@ -186,7 +194,7 @@ const SavedPapersView: React.FC = () => {
                       <PaperCard
                         key={paper.id}
                         paper={transformPaperForCard(paper)}
-                        rank={1}
+                        priority={cardPosition++ < 3}
                       />
                     ))}
                   </div>

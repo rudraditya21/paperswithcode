@@ -1,5 +1,6 @@
-"""Parsing and adoption tests for the Surge AI Chartography sync."""
+"""Parsing and adoption tests for the Surge AI Chartography board."""
 
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -27,15 +28,16 @@ from backend.models.database import (
     TaskDatasetMetric,
 )
 from backend.services import surge_chartography_sync_service as service
+from backend.services.live_leaderboard_sync import LiveLeaderboardSyncService
 from backend.services.surge_chartography_sync_service import (
-    MANAGED_METHODOLOGY_PREFIX,
+    BOARD,
     METRIC_NAME,
     MODEL_IDENTITIES,
     SURGE_CHARTOGRAPHY_URL,
-    SurgeChartographySyncService,
     fetch_surge_chartography,
     parse_surge_chartography,
 )
+from backend.tests.evaluation.model_evidence import add_release_evidence
 
 
 @compiles(BigInteger, "sqlite")
@@ -56,47 +58,47 @@ HTML = (Path(__file__).parent / "fixtures" / "surge_chartography.html").read_tex
 
 # The 41 rows hand-imported on 2026-10-17: model_name -> stored Pass@1.
 PRODUCTION_ROWS = {
-    "Gemini 4 Argon (no tools)": 0.716,
-    "GPT-6 Astra (no tools)": 0.71,
-    "Claude Opus 5.5 (no tools)": 0.663,
-    "GPT-6 Sol (no tools)": 0.536,
-    "Claude Fable 5.1 (no tools)": 0.462,
-    "GPT-5.6 Sol (no tools)": 0.45,
-    "Gemini 3.8 Flash (no tools)": 0.409,
-    "Gemini 3.7 Flash (no tools)": 0.404,
-    "Claude Fable 5 (no tools)": 0.348,
-    "GPT-5.6 Terra (no tools)": 0.34,
-    "Gemini 3.6 Flash (no tools)": 0.34,
-    "Muse Spark 1.2 (no tools)": 0.321,
-    "GPT-5.6 Luna (no tools)": 0.314,
-    "GPT-5.5 (no tools)": 0.31,
-    "GPT-5.4 (no tools)": 0.296,
-    "GPT-6 Luna (no tools)": 0.291,
-    "Qwen3.8-Max (no tools)": 0.291,
-    "Muse Spark 1.3 (no tools)": 0.276,
-    "Claude Opus 5 (no tools)": 0.273,
-    "Kimi K3 (no tools)": 0.266,
-    "Gemini 3.1 Pro (no tools)": 0.261,
-    "Muse Spark 1.1 (no tools)": 0.244,
-    "Grok 4.6 (no tools)": 0.205,
-    "Qwen3.8-Flash (no tools)": 0.174,
-    "Muse Glimmer-30B (no tools)": 0.172,
-    "Grok 4.5 (no tools)": 0.17,
-    "Claude Sonnet 5 (no tools)": 0.166,
-    "Claude Opus 4.7 (no tools)": 0.165,
-    "GLM-5.3-Flash (no tools)": 0.163,
-    "Qwen3.5-Plus (no tools)": 0.159,
-    "Claude Opus 4.8 (no tools)": 0.159,
-    "Qwen3.7-Plus (no tools)": 0.158,
-    "Grok 4.7 (no tools)": 0.147,
-    "Grok 4.3 (no tools)": 0.129,
-    "Kimi K2.5 (no tools)": 0.126,
-    "Kimi K2.6 (no tools)": 0.122,
-    "DeepSeek-V4.1-Flash (no tools)": 0.116,
-    "Gemini 3.5 Flash-Lite (no tools)": 0.102,
-    "Inkling (no tools)": 0.1,
-    "Inkling-Small (no tools)": 0.091,
-    "Mistral Large 3 (no tools)": 0.09,
+    "Gemini 4 Argon (no tools)": 71.6,
+    "GPT-6 Astra (no tools)": 71,
+    "Claude Opus 5.5 (no tools)": 66.3,
+    "GPT-6 Sol (no tools)": 53.6,
+    "Claude Fable 5.1 (no tools)": 46.2,
+    "GPT-5.6 Sol (no tools)": 45,
+    "Gemini 3.8 Flash (no tools)": 40.9,
+    "Gemini 3.7 Flash (no tools)": 40.4,
+    "Claude Fable 5 (no tools)": 34.8,
+    "GPT-5.6 Terra (no tools)": 34,
+    "Gemini 3.6 Flash (no tools)": 34,
+    "Muse Spark 1.2 (no tools)": 32.1,
+    "GPT-5.6 Luna (no tools)": 31.4,
+    "GPT-5.5 (no tools)": 31,
+    "GPT-5.4 (no tools)": 29.6,
+    "GPT-6 Luna (no tools)": 29.1,
+    "Qwen3.8-Max (no tools)": 29.1,
+    "Muse Spark 1.3 (no tools)": 27.6,
+    "Claude Opus 5 (no tools)": 27.3,
+    "Kimi K3 (no tools)": 26.6,
+    "Gemini 3.1 Pro (no tools)": 26.1,
+    "Muse Spark 1.1 (no tools)": 24.4,
+    "Grok 4.6 (no tools)": 20.5,
+    "Qwen3.8-Flash (no tools)": 17.4,
+    "Muse Glimmer-30B (no tools)": 17.2,
+    "Grok 4.5 (no tools)": 17,
+    "Claude Sonnet 5 (no tools)": 16.6,
+    "Claude Opus 4.7 (no tools)": 16.5,
+    "GLM-5.3-Flash (no tools)": 16.3,
+    "Qwen3.5-Plus (no tools)": 15.9,
+    "Claude Opus 4.8 (no tools)": 15.9,
+    "Qwen3.7-Plus (no tools)": 15.8,
+    "Grok 4.7 (no tools)": 14.7,
+    "Grok 4.3 (no tools)": 12.9,
+    "Kimi K2.5 (no tools)": 12.6,
+    "Kimi K2.6 (no tools)": 12.2,
+    "DeepSeek-V4.1-Flash (no tools)": 11.6,
+    "Gemini 3.5 Flash-Lite (no tools)": 10.2,
+    "Inkling (no tools)": 10,
+    "Inkling-Small (no tools)": 9.1,
+    "Mistral Large 3 (no tools)": 9,
 }
 TASK_ID = 8
 DATASET_ID = 2701
@@ -115,7 +117,7 @@ def _identity(model_name: str):
     return next(
         identity
         for identity in MODEL_IDENTITIES.values()
-        if identity.row_model_name == model_name
+        if f"{identity.model_name}{service.MODEL_NAME_SUFFIX}" == model_name
     )
 
 
@@ -199,12 +201,16 @@ def _seed_production(session: Session) -> None:
             task_id=TASK_ID,
             dataset_id=WITH_TOOLS_DATASET_ID,
             model_name="Claude Opus 5.5",
-            metrics={METRIC_NAME: 0.5},
+            metrics={METRIC_NAME: 50.0},
             methodology="Anthropic system card.",
             external=True,
         )
     )
     session.commit()
+
+
+def _sync(session: Session, entries, **kwargs):
+    return LiveLeaderboardSyncService(session, BOARD).sync(entries, **kwargs)
 
 
 def _rows(session: Session, dataset_id: int = DATASET_ID) -> dict[str, Evaluation]:
@@ -220,20 +226,19 @@ def test_parse_and_fetch_the_leaderboard_block():
     entries = parse_surge_chartography(HTML)
     assert len(entries) == 42
     first = entries[0]
-    assert (first.position, first.label, first.configuration, str(first.score)) == (
-        1,
+    assert (first.label, first.value, first.detail) == (
         "Gemini 4 Argon",
-        "High reasoning",
-        "71.6",
+        Decimal("71.6"),
+        "71.6% Pass@1 (High reasoning)",
     )
     by_label = {entry.label: entry for entry in entries}
-    assert by_label["Inkling"].configuration == "High reasoning"
-    assert by_label["Inkling Small"].configuration == "xHigh reasoning"
-    assert by_label["Mistral Large 3"].configuration == "default"
-    assert by_label["DeepSeek V4 Flash Vision (experimental)"].configuration == (
-        "Max reasoning"
+    assert by_label["Inkling"].detail.endswith("(High reasoning)")
+    assert by_label["Inkling Small"].detail.endswith("(xHigh reasoning)")
+    assert by_label["Mistral Large 3"].detail.endswith("(default)")
+    assert by_label["DeepSeek V4 Flash Vision (experimental)"].detail.endswith(
+        "(Max reasoning)"
     )
-    assert str(by_label["GPT 6 Astra"].score) == "71"
+    assert by_label["GPT 6 Astra"].detail == "71% Pass@1 (Max reasoning)"
     assert (by_label["Gemini 4 Argon"].lab, by_label["Inkling"].lab) == ("Google", "")
 
     def handler(request):
@@ -280,7 +285,7 @@ def test_parser_enforces_row_bounds_range_and_uniqueness(monkeypatch):
 def test_first_run_adopts_every_hand_imported_row():
     session = _session()
     _seed_production(session)
-    stats = SurgeChartographySyncService(session).sync(parse_surge_chartography(HTML))
+    stats = _sync(session, parse_surge_chartography(HTML))
 
     assert stats.fetched == 42
     assert (stats.matched, stats.adopted, stats.created, stats.changed) == (
@@ -289,16 +294,16 @@ def test_first_run_adopts_every_hand_imported_row():
         0,
         0,
     )
-    assert stats.excluded == ["DeepSeek V4 Flash Vision (experimental)"]
+    assert stats.excluded == 1  # DeepSeek V4 Flash Vision (experimental)
     assert stats.unreviewed == []
     assert stats.missing_papers == [] and stats.missing_upstream == []
     rows = _rows(session)
     assert len(rows) == 41
     argon = rows["Gemini 4 Argon (no tools)"]
-    assert argon.best_rank == 1 and argon.metrics == {METRIC_NAME: 0.716}
+    assert argon.best_rank == 1 and argon.metrics == {METRIC_NAME: 71.6}
     assert argon.methodology.startswith(
-        f'{MANAGED_METHODOLOGY_PREFIX} Official leaderboard entry "Gemini 4 Argon" '
-        "(High reasoning): 71.6% Pass@1"
+        f'{BOARD.managed_prefix} Official leaderboard entry "Gemini 4 Argon": '
+        "71.6% Pass@1 (High reasoning)"
     )
     assert argon.methodology.endswith(
         "Hand-reviewed notes for Gemini 4 Argon (no tools)."
@@ -306,10 +311,10 @@ def test_first_run_adopts_every_hand_imported_row():
     assert rows["Kimi K2.6 (no tools)"].num_parameters == 123
     assert rows["Qwen3.8-Max (no tools)"].is_open
 
-    again = SurgeChartographySyncService(session).sync(parse_surge_chartography(HTML))
+    again = _sync(session, parse_surge_chartography(HTML))
     assert (again.adopted, again.created, again.changed) == (0, 0, 0)
     assert _rows(session, WITH_TOOLS_DATASET_ID)["Claude Opus 5.5"].metrics == {
-        METRIC_NAME: 0.5
+        METRIC_NAME: 50.0
     }
     assert _rows(session)["Gemini 4 Argon (no tools)"].methodology == argon.methodology
 
@@ -317,19 +322,17 @@ def test_first_run_adopts_every_hand_imported_row():
 def test_score_and_configuration_updates_revise_the_row():
     session = _session()
     _seed_production(session)
-    SurgeChartographySyncService(session).sync(parse_surge_chartography(HTML))
+    _sync(session, parse_surge_chartography(HTML))
     updated = (
         HTML.replace("4 Argon (High reasoning)", "4 Argon (Max reasoning)", 1)
         .replace('data-score="71.6"', 'data-score="73.25"', 1)
         .replace(">71.6<", ">73.25<", 1)
     )
-    stats = SurgeChartographySyncService(session).sync(
-        parse_surge_chartography(updated)
-    )
+    stats = _sync(session, parse_surge_chartography(updated))
     assert (stats.changed, stats.created, stats.adopted) == (1, 0, 0)
     argon = _rows(session)["Gemini 4 Argon (no tools)"]
-    assert argon.metrics == {METRIC_NAME: 0.7325}
-    assert '"Gemini 4 Argon" (Max reasoning): 73.25% Pass@1' in argon.methodology
+    assert argon.metrics == {METRIC_NAME: 73.25}
+    assert '"Gemini 4 Argon": 73.25% Pass@1 (Max reasoning)' in argon.methodology
     assert argon.methodology.endswith(
         "Hand-reviewed notes for Gemini 4 Argon (no tools)."
     )
@@ -345,15 +348,14 @@ def test_new_mapped_rows_are_created_and_new_labels_reported():
     renamed = HTML.replace(">Inkling<", ">Nova<", 1).replace(
         ">Inkling (High reasoning)<", ">Nova 2 (High reasoning)<", 1
     )
-    stats = SurgeChartographySyncService(session).sync(
-        parse_surge_chartography(renamed)
-    )
+    stats = _sync(session, parse_surge_chartography(renamed))
     assert stats.created == 1
     assert stats.unreviewed == ["Nova 2"]
     assert stats.missing_upstream == []
     created = _rows(session)["Mistral Large 3 (no tools)"]
-    assert created.metrics == {METRIC_NAME: 0.09}
+    assert created.metrics == {METRIC_NAME: 9.0}
     assert created.is_open and created.external_source_url == SURGE_CHARTOGRAPHY_URL
+    assert created.evaluated_on is not None
     # Its row shows no lab logo, so there is no lab to hand to the radar.
     assert session.query(ModelReleaseSignal).count() == 0
 
@@ -371,13 +373,12 @@ def test_new_labels_are_auto_matched_or_handed_to_the_radar():
             is_latest_version=True,
         )
     )
+    add_release_evidence(session, 2001)
     session.commit()
     renamed = HTML.replace(">K2.5 (Thinking on)<", ">K3.5 (Thinking on)<", 1).replace(
         ">Large 3<", ">Large 4<", 1
     )
-    stats = SurgeChartographySyncService(session).sync(
-        parse_surge_chartography(renamed)
-    )
+    stats = _sync(session, parse_surge_chartography(renamed))
 
     assert (stats.auto_matched, stats.unreviewed) == (
         ["Kimi K3.5"],
@@ -387,16 +388,14 @@ def test_new_labels_are_auto_matched_or_handed_to_the_radar():
     assert (kimi.paper_id, kimi.is_open, kimi.metrics) == (
         2001,
         False,
-        {METRIC_NAME: 0.126},
+        {METRIC_NAME: 12.6},
     )
-    assert '"Kimi K3.5" (Thinking on): 12.6% Pass@1' in kimi.methodology
+    assert '"Kimi K3.5": 12.6% Pass@1 (Thinking on)' in kimi.methodology
     signal = session.query(ModelReleaseSignal).one()
     assert (signal.lab, signal.model_name) == ("Mistral", "Mistral Large 4")
     assert signal.lead_url == SURGE_CHARTOGRAPHY_URL
 
-    again = SurgeChartographySyncService(session).sync(
-        parse_surge_chartography(renamed)
-    )
+    again = _sync(session, parse_surge_chartography(renamed))
     assert (again.created, again.changed) == (0, 0)
     assert session.query(ModelReleaseSignal).one().sightings == 2
 
@@ -405,9 +404,9 @@ def test_managed_rows_dropped_upstream_are_reported_not_deleted():
     session = _session()
     _seed_production(session)
     entries = parse_surge_chartography(HTML)
-    SurgeChartographySyncService(session).sync(entries)
+    _sync(session, entries)
     remaining = [entry for entry in entries if entry.label != "Mistral Large 3"]
-    stats = SurgeChartographySyncService(session).sync(remaining)
+    stats = _sync(session, remaining)
     assert stats.missing_upstream == ["Mistral Large 3 (no tools)"]
     assert "Mistral Large 3 (no tools)" in _rows(session)
 
@@ -416,12 +415,12 @@ def test_dry_run_rolls_back_and_collapsed_selection_is_refused():
     session = _session()
     _seed_production(session)
     entries = parse_surge_chartography(HTML)
-    SurgeChartographySyncService(session).sync(entries, commit=False)
+    _sync(session, entries, commit=False)
     assert _rows(session)["GPT-5.5 (no tools)"].methodology == (
         "Hand-reviewed notes for GPT-5.5 (no tools)."
     )
     with pytest.raises(RuntimeError, match="refusing"):
-        SurgeChartographySyncService(session).sync(entries[:10])
+        _sync(session, entries[:10])
 
 
 def test_unconfigured_leaderboard_is_refused():
@@ -431,4 +430,30 @@ def test_unconfigured_leaderboard_is_refused():
     ).delete()
     session.commit()
     with pytest.raises(RuntimeError, match="not linked"):
-        SurgeChartographySyncService(session).sync(parse_surge_chartography(HTML))
+        _sync(session, parse_surge_chartography(HTML))
+
+
+def test_rows_written_by_the_former_surge_service_keep_their_notes():
+    session = _session()
+    _seed_production(session)
+    entries = parse_surge_chartography(HTML)
+    _sync(session, entries)
+    argon = _rows(session)["Gemini 4 Argon (no tools)"]
+    # The head the dedicated Chartography service wrote, with reviewer notes.
+    argon.methodology = (
+        "Managed by the Papers with Code Surge AI Chartography live sync. "
+        'Official leaderboard entry "Gemini 4 Argon" (High reasoning): 71.6% '
+        "Pass@1, listed at https://surgehq.ai/benchmarks/chartography. "
+        "All 100 tasks, no tools."
+    )
+    session.commit()
+
+    stats = _sync(session, entries)
+    assert stats.changed == 1
+    assert argon.methodology == (
+        "Managed by the Papers with Code Surge AI Chartography live sync. "
+        'Official leaderboard entry "Gemini 4 Argon": 71.6% Pass@1 '
+        "(High reasoning), listed at https://surgehq.ai/benchmarks/chartography. "
+        "All 100 tasks, no tools."
+    )
+    assert _sync(session, entries).changed == 0

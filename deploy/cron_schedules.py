@@ -172,14 +172,9 @@ TIMERS: tuple[TimerSpec, ...] = (
         description="Discover author X threads for trending papers twice daily",
     ),
     TimerSpec(
-        job="post_trending_paper_to_x",
-        on_calendar=("*-*-* 00/4:13:00",),
-        description="Post a trending paper to the Papers with Code X account every four hours",
-    ),
-    TimerSpec(
-        job="post_x_insight",
-        on_calendar=("*-*-* 09,17:43:00",),
-        description="Post a SOTA, trend, or roundup insight to X twice daily",
+        job="refresh_x_post_likes",
+        on_calendar=("*-*-* *:35:00",),
+        description="Refresh like counts of linked X posts in their first week",
     ),
     TimerSpec(
         job="link_abstract_mentions",
@@ -243,11 +238,6 @@ TIMERS: tuple[TimerSpec, ...] = (
         description="Sync ParseBench leaderboard hourly",
     ),
     TimerSpec(
-        job="sync_mmteb_retrieval",
-        on_calendar=("*-*-* *:22:00",),
-        description="Sync MMTEB v2 retrieval leaderboard hourly",
-    ),
-    TimerSpec(
         job="sync_deepswe",
         on_calendar=("*-*-* *:25:00",),
         description="Sync DeepSWE leaderboard hourly",
@@ -268,9 +258,79 @@ TIMERS: tuple[TimerSpec, ...] = (
         description="Sync Surge AI Chartography leaderboard hourly",
     ),
     TimerSpec(
+        job="sync_swe_marathon",
+        on_calendar=("*-*-* *:26:00",),
+        description="Sync SWE-Marathon leaderboard from Abundant AI hourly",
+    ),
+    TimerSpec(
+        job="sync_jevbench",
+        on_calendar=("*-*-* *:37:00",),
+        description="Sync JevBench leaderboard from Benchmark Heaven hourly",
+    ),
+    TimerSpec(
         job="sync_frontiercs_2",
         on_calendar=("*-*-* *:43:00",),
         description="Sync FrontierCS 2 leaderboard hourly",
+    ),
+    TimerSpec(
+        job="sync_vals_index",
+        on_calendar=("*-*-* *:03:00",),
+        description="Sync Vals Index leaderboard hourly",
+    ),
+    TimerSpec(
+        job="sync_swe_sweep",
+        on_calendar=("*-*-* *:08:00",),
+        description="Sync SWE-sweep leaderboard hourly",
+    ),
+    TimerSpec(
+        job="sync_vending_bench_2",
+        on_calendar=("*-*-* *:13:00",),
+        description="Sync Vending-Bench 2 leaderboard hourly",
+    ),
+    TimerSpec(
+        job="sync_blueprint_bench_2",
+        on_calendar=("*-*-* *:16:00",),
+        description="Sync Blueprint-Bench 2 leaderboard hourly",
+    ),
+    TimerSpec(
+        job="sync_riemann_bench",
+        on_calendar=("*-*-* *:23:00",),
+        description="Sync Riemann-Bench leaderboard hourly",
+    ),
+    TimerSpec(
+        job="sync_cwe_bench",
+        on_calendar=("*-*-* *:34:00",),
+        description="Sync CWE-bench leaderboard hourly",
+    ),
+    TimerSpec(
+        job="sync_exploitgym",
+        on_calendar=("*-*-* *:46:00",),
+        description="Sync ExploitGym leaderboard hourly",
+    ),
+    TimerSpec(
+        job="sync_cybergym",
+        on_calendar=("*-*-* *:09:00",),
+        description="Sync CyberGym leaderboard hourly",
+    ),
+    TimerSpec(
+        job="sync_patcheval_verified",
+        on_calendar=("*-*-* *:21:00",),
+        description="Sync PatchEval-Verified leaderboard hourly",
+    ),
+    TimerSpec(
+        job="sync_critpt",
+        on_calendar=("*-*-* 00/2:52:00",),
+        description="Sync CritPt leaderboard from Artificial Analysis every two hours",
+    ),
+    TimerSpec(
+        job="sync_critpt_v2",
+        on_calendar=("*-*-* 01/2:52:00",),
+        description="Sync CritPt v2 leaderboard from Artificial Analysis every two hours",
+    ),
+    TimerSpec(
+        job="sync_terminal_bench_science",
+        on_calendar=("*-*-* 00/2:54:00",),
+        description="Sync Terminal-Bench-Science leaderboard from Artificial Analysis every two hours",
     ),
     TimerSpec(
         job="sync_physics_iq_verified",
@@ -281,11 +341,6 @@ TIMERS: tuple[TimerSpec, ...] = (
         job="sync_artificial_analysis",
         on_calendar=("*-*-* 00/2:35:00",),
         description="Sync Artificial Analysis leaderboards every two hours",
-    ),
-    TimerSpec(
-        job="sync_mmteb_reranking",
-        on_calendar=("*-*-* *:37:00",),
-        description="Sync MMTEB v2 reranking leaderboard hourly",
     ),
     TimerSpec(
         job="sync_programbench",

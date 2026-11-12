@@ -14,20 +14,24 @@ import httpx
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
-    Dataset,
     Evaluation,
     HfArtifact,
-    Metric,
     Paper,
     PaperHfArtifact,
     PaperProjectPage,
     PaperRepository,
     ProjectPage,
     Repository,
-    Task,
-    TaskDatasetMetric,
 )
 from backend.services.evaluation_service import EvaluationService
+from backend.services.leaderboard_model_matching_service import (
+    LeaderboardModel,
+    LeaderboardModelMatcher,
+    link_owner,
+)
+from backend.services.leaderboard_sync_catalog import (
+    resolve_leaderboard,
+)
 from backend.services.leaderboard_sync_ownership import managed_methodology_prefix
 
 MMEB_SPACE_URL = "https://huggingface.co/spaces/TIGER-Lab/MMEB-Leaderboard"
@@ -90,6 +94,7 @@ class MmebSyncStats:
     created: int = 0
     updated: int = 0
     deleted: int = 0
+    auto_matched: list[str] = field(default_factory=list)
     unresolved_models: list[str] = field(default_factory=list)
     ambiguous_models: list[str] = field(default_factory=list)
     unmanaged_conflicts: list[str] = field(default_factory=list)
@@ -102,6 +107,7 @@ class MmebSyncStats:
             "created": self.created,
             "updated": self.updated,
             "deleted": self.deleted,
+            "auto_matched": self.auto_matched,
             "unresolved_models": self.unresolved_models,
             "ambiguous_models": self.ambiguous_models,
             "unmanaged_conflicts": self.unmanaged_conflicts,
@@ -282,38 +288,26 @@ def _repo_id(url: str | None) -> str | None:
     return "/".join(parts[:2])
 
 
+_PAPER_HOSTS = {"arxiv.org", "openreview.net", "aclanthology.org", "doi.org"}
+
+
+def _lab(model_url: str) -> str:
+    """The best available publisher of a model link.
+
+    The Space has no organization column, so this is the Hub or GitHub owner,
+    else the link's host. Paper hosts and unlinked models name no publisher.
+    """
+    if (owner := link_owner(model_url)) is not None:
+        return owner
+    host = urlsplit(model_url).netloc.lower().removeprefix("www.")
+    return "" if host in _PAPER_HOSTS else host
+
+
 class MmebSyncService:
     """Replace one MMEB aggregate leaderboard with linked official rows."""
 
     def __init__(self, db: Session):
         self.db = db
-
-    def _leaderboard_identity(self, version: str) -> tuple[Task, Dataset, str, str]:
-        try:
-            dataset_slug, metric_name, source_label = LANES[version]
-        except KeyError as exc:
-            raise ValueError(f"Unknown MMEB version: {version}") from exc
-        task = self.db.query(Task).filter(Task.slug == "embedding-models").one_or_none()
-        dataset = (
-            self.db.query(Dataset).filter(Dataset.slug == dataset_slug).one_or_none()
-        )
-        metric = self.db.query(Metric).filter(Metric.name == metric_name).one_or_none()
-        if task is None or dataset is None or metric is None:
-            raise RuntimeError(
-                f"MMEB {version} task, benchmark, or metric is not configured"
-            )
-        configured = (
-            self.db.query(TaskDatasetMetric)
-            .filter(
-                TaskDatasetMetric.task_id == task.id,
-                TaskDatasetMetric.dataset_id == dataset.id,
-                TaskDatasetMetric.metric_id == metric.id,
-            )
-            .one_or_none()
-        )
-        if configured is None:
-            raise RuntimeError(f"MMEB {metric_name} is not linked to embedding-models")
-        return task, dataset, metric_name, source_label
 
     def _paper_candidates(self, entry: MmebEntry) -> list[Paper]:
         ids: set[int] = set()
@@ -405,7 +399,12 @@ class MmebSyncService:
 
     @staticmethod
     def _validate_coverage(
-        *, version: str, fetched: int, resolved: int, existing_managed: int
+        *,
+        version: str,
+        fetched: int,
+        resolved: int,
+        auto_matched: int,
+        existing_managed: int,
     ) -> None:
         if fetched < MIN_EXPECTED_ENTRIES:
             return
@@ -414,9 +413,10 @@ class MmebSyncService:
                 f"MMEB {version} resolved only {resolved} linked rows; refusing "
                 "to replace the managed leaderboard"
             )
-        if existing_managed and resolved * 2 < existing_managed:
+        published = resolved + auto_matched
+        if existing_managed and published * 2 < existing_managed:
             raise RuntimeError(
-                f"MMEB {version} resolved {resolved} rows versus {existing_managed} "
+                f"MMEB {version} resolved {published} rows versus {existing_managed} "
                 "managed rows; refusing a drop over 50%"
             )
 
@@ -436,14 +436,43 @@ class MmebSyncService:
         stats = MmebSyncStats(fetched=len(entries))
 
         try:
-            task, dataset, metric_name, source_label = self._leaderboard_identity(
-                version
+            try:
+                dataset_slug, metric_name, source_label = LANES[version]
+            except KeyError as exc:
+                raise ValueError(f"Unknown MMEB version: {version}") from exc
+            task, dataset = resolve_leaderboard(
+                self.db,
+                f"MMEB {version}",
+                "embedding-models",
+                dataset_slug,
+                (metric_name,),
             )
             scored = [
                 entry for entry in entries if (entry.scores.get(version) or 0) > 0
             ]
             stats.scored = len(scored)
             papers_by_model = self._resolve_papers(scored, stats)
+            # Models with no linked local paper go to the shared matcher; the
+            # rest become release-radar signals. Ambiguous links stay out.
+            unresolved = set(stats.unresolved_models)
+            unknown = [
+                LeaderboardModel(entry.model_name, _lab(entry.model_url))
+                for entry in scored
+                if entry.model_name in unresolved
+            ]
+            matcher = LeaderboardModelMatcher(
+                self.db,
+                provider="mmeb",
+                leaderboard_name="MMEB",
+                leaderboard_url=MMEB_SPACE_URL,
+            )
+            auto_matched = matcher.match(unknown)
+            auto_papers = {
+                paper.id: paper
+                for paper in self.db.query(Paper)
+                .filter(Paper.id.in_({m.paper_id for m in auto_matched.values()}))
+                .all()
+            }
             managed_rows = (
                 self.db.query(Evaluation)
                 .filter(
@@ -458,6 +487,7 @@ class MmebSyncService:
                 version=version,
                 fetched=len(entries),
                 resolved=len(papers_by_model),
+                auto_matched=len(auto_matched),
                 existing_managed=len(managed_rows),
             )
             managed_by_name = {row.model_name: row for row in managed_rows}
@@ -478,6 +508,9 @@ class MmebSyncService:
 
             for entry in scored:
                 paper = papers_by_model.get(entry.model_name)
+                match = auto_matched.get(entry.model_name)
+                if paper is None and match is not None:
+                    paper = auto_papers[match.paper_id]
                 if paper is None:
                     continue
                 if (
@@ -491,8 +524,13 @@ class MmebSyncService:
                 methodology = (
                     f"{MANAGED_METHODOLOGY_PREFIX} Official {source_label} aggregate "
                     f"from the MMEB leaderboard Space; source rank "
-                    f"{entry.ranks[version]}; fetched {now.isoformat()}. Only rows "
-                    "with one unambiguous local paper/resource match are synchronized."
+                    f"{entry.ranks[version]}; fetched {now.isoformat()}. "
+                    + (
+                        "Matched to the model's release paper by name."
+                        if match is not None
+                        else "Only rows with one unambiguous local paper/resource "
+                        "match are synchronized."
+                    )
                 )
                 row = managed_by_name.get(entry.model_name)
                 if row is None:
@@ -513,20 +551,31 @@ class MmebSyncService:
                 row.uses_additional_data = False
                 row.is_open = entry.is_open
                 row.num_parameters = entry.total_params
-                row.hf_model_url = entry.hf_model_url
+                row.hf_model_url = entry.hf_model_url or (
+                    match.hf_model_url if match is not None else None
+                )
                 row.evaluated_on = entry.reported_on
                 row.external_source_url = MMEB_SPACE_URL
                 row.source_url = MMEB_SPACE_URL
                 row.external = True
                 row.updated_at = now
-                if entry.hf_model_url:
+                if match is not None:
+                    stats.auto_matched.append(entry.model_name)
+                elif entry.hf_model_url:
                     hf_models = list(paper.hf_models or [])
                     if entry.hf_model_url not in hf_models:
                         hf_models.append(entry.hf_model_url)
                         paper.hf_models = hf_models
                 stats.matched += 1
 
-            current_names = set(papers_by_model)
+            published = set(stats.auto_matched)
+            stats.unresolved_models = [
+                name for name in stats.unresolved_models if name not in published
+            ]
+            matcher.report_unmatched(
+                [model for model in unknown if model.name not in auto_matched]
+            )
+            current_names = set(papers_by_model) | set(auto_matched)
             for row in managed_rows:
                 if row.model_name not in current_names:
                     self.db.delete(row)

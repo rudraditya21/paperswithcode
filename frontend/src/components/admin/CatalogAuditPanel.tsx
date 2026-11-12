@@ -9,28 +9,30 @@ import { paperEditsApi } from "@/lib/api/paperEdits";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { catalogApi } from "@/lib/api/catalog";
+import { adminKeys } from "@/lib/api/queries";
 
 export const CatalogAuditPanel = () => {
   const queryClient = useQueryClient();
   const query = useInfiniteQuery({
-    queryKey: ["catalog-audit"],
+    queryKey: adminKeys.catalogAudit,
     queryFn: ({ pageParam }) => catalogApi.audit(pageParam),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
   });
   const events = query.data?.pages.flatMap((page) => page.events) ?? [];
+  const refresh = () => queryClient.invalidateQueries({ queryKey: adminKeys.catalogAudit });
   const acknowledge = useMutation({
     mutationFn: () => catalogApi.acknowledgeAudit(),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["catalog-audit"] }),
+    onSuccess: refresh,
   });
   const rollback = useMutation({
     mutationFn: (eventId: string) => catalogApi.rollbackEvent(eventId),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["catalog-audit"] }),
+    onSuccess: refresh,
   });
 
   const suspension = useMutation({
     mutationFn: ({ subject, suspended }: { subject: string; suspended: boolean }) => paperEditsApi.suspend(subject, suspended),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["catalog-audit"] }),
+    onSuccess: refresh,
   });
 
   return (

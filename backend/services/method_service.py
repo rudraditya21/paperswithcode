@@ -342,8 +342,8 @@ class MethodService:
                 results=methods,
             )
 
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve methods: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve methods: {str(e)}") from e
 
     def get_method_index(
         self,
@@ -547,10 +547,8 @@ class MethodService:
 
         except ValueError:
             raise PaperNotFoundError(f"Invalid method ID: {method_id}")
-        except PaperNotFoundError:
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve method: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve method: {str(e)}") from e
 
     def get_method_by_name(self, method_name: str) -> Method:
         """
@@ -574,7 +572,7 @@ class MethodService:
                 .filter(
                     or_(
                         DBMethod.slug == method_name.lower(),
-                        DBMethod.name.ilike(method_name),
+                        func.lower(DBMethod.name) == method_name.lower(),
                     )
                 )
                 .first()
@@ -593,10 +591,8 @@ class MethodService:
 
             return self._convert_db_method_to_api(db_method, paper_count)
 
-        except PaperNotFoundError:
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve method: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve method: {str(e)}") from e
 
     def get_methods_for_paper(
         self,
@@ -659,10 +655,10 @@ class MethodService:
                 results=methods,
             )
 
-        except Exception as e:
+        except SQLAlchemyError as e:
             raise DatabaseError(
                 f"Failed to retrieve methods for paper {paper_id}: {str(e)}"
-            )
+            ) from e
 
     def search_methods(
         self,
@@ -893,7 +889,7 @@ class MethodService:
                     .filter(
                         or_(
                             DBMethod.slug == method_id.lower(),
-                            DBMethod.name.ilike(method_id),
+                            func.lower(DBMethod.name) == method_id.lower(),
                         )
                     )
                     .first()
@@ -935,8 +931,8 @@ class MethodService:
             raise
         except ValueError:
             raise PaperNotFoundError(f"Invalid method ID: {method_id}")
-        except Exception as e:
-            raise DatabaseError(f"Failed to get papers for method: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to get papers for method: {str(e)}") from e
 
     def add_keywords(self, method_id: str, keywords: List[str]) -> Method:
         """
@@ -969,7 +965,7 @@ class MethodService:
                     .filter(
                         or_(
                             DBMethod.slug == method_id.lower(),
-                            DBMethod.name.ilike(method_id),
+                            func.lower(DBMethod.name) == method_id.lower(),
                         )
                     )
                     .first()
@@ -1001,7 +997,7 @@ class MethodService:
             raise
         except Exception as e:
             self.db.rollback()
-            raise DatabaseError(f"Failed to add keywords to method: {str(e)}")
+            raise DatabaseError(f"Failed to add keywords to method: {str(e)}") from e
 
     def remove_keywords(self, method_id: str, keywords: List[str]) -> Method:
         """
@@ -1034,7 +1030,7 @@ class MethodService:
                     .filter(
                         or_(
                             DBMethod.slug == method_id.lower(),
-                            DBMethod.name.ilike(method_id),
+                            func.lower(DBMethod.name) == method_id.lower(),
                         )
                     )
                     .first()
@@ -1068,7 +1064,9 @@ class MethodService:
             raise
         except Exception as e:
             self.db.rollback()
-            raise DatabaseError(f"Failed to remove keywords from method: {str(e)}")
+            raise DatabaseError(
+                f"Failed to remove keywords from method: {str(e)}"
+            ) from e
 
     def replace_keywords(self, method_id: str, keywords: List[str]) -> Method:
         """
@@ -1101,7 +1099,7 @@ class MethodService:
                     .filter(
                         or_(
                             DBMethod.slug == method_id.lower(),
-                            DBMethod.name.ilike(method_id),
+                            func.lower(DBMethod.name) == method_id.lower(),
                         )
                     )
                     .first()
@@ -1123,4 +1121,6 @@ class MethodService:
             raise
         except Exception as e:
             self.db.rollback()
-            raise DatabaseError(f"Failed to replace keywords for method: {str(e)}")
+            raise DatabaseError(
+                f"Failed to replace keywords for method: {str(e)}"
+            ) from e

@@ -179,6 +179,21 @@ class Settings(BaseSettings, ChatSettings):
     openrouter_api_key: str = Field(default="", description="OpenRouter API key")
     openai_api_key: str = Field(default="", description="OpenAI API key")
 
+    # Voice dictation in chat composers (see backend/services/dictation_service.py)
+    dictation_enabled: bool = Field(default=False)
+    dictation_endpoint_url: str = Field(
+        default="",
+        description="HF Inference Endpoint serving Voxtral Realtime through vLLM",
+    )
+    dictation_voxtral_model: str = Field(
+        default="mistralai/Voxtral-Mini-4B-Realtime-2602"
+    )
+    dictation_voxtral_capacity: int = Field(default=2, ge=0)
+    dictation_openai_model: str = Field(default="gpt-4o-mini-transcribe")
+    dictation_session_seconds: int = Field(default=120, ge=10)
+    dictation_user_daily_seconds: int = Field(default=1800, ge=0)
+    dictation_openai_daily_seconds: int = Field(default=18000, ge=0)
+
     # Admin API configuration
     admin_api_token: str = Field(
         default="",
@@ -241,7 +256,7 @@ class Settings(BaseSettings, ChatSettings):
     codex_jobs_api_url: str = Field(default="https://paperswithcode.co/api/v1")
     codex_jobs_timeout_seconds: int = Field(default=5400, ge=300, le=14400)
     codex_jobs_cli_version: str = Field(default="0.75.0")
-    codex_jobs_model: str = Field(default="gpt-5.6-luna")
+    codex_jobs_model: str = Field(default="gpt-6-luna")
     codex_jobs_reasoning_effort: str = Field(default="medium")
     # AI conference deadline research runs off-box on Hugging Face Jobs (Claude
     # Agent SDK); only the validated, bounded DB writes happen on the VPS.
@@ -267,6 +282,23 @@ class Settings(BaseSettings, ChatSettings):
     codex_curation_queue_depth: int = Field(default=200, ge=1, le=2000)
     codex_curation_reconcile_limit: int = Field(default=200, ge=1, le=500)
     codex_curation_canary_limit: int = Field(default=10, ge=1, le=100)
+    # Pi shadow runs pair a sample of daily-curation stages with a second job on
+    # an open model through HF Inference Providers. They only store validated
+    # proposals for comparison, use their own small slot pool, and are skipped
+    # (never queued) while the pool is full or any setting below is missing.
+    curation_pi_shadow_sample_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    curation_pi_shadow_max_active: int = Field(default=2, ge=1, le=8)
+    # Digest-pinned image built by .github/workflows/build-pi-curator-image.yml.
+    curation_pi_jobs_image: str = Field(default="")
+    # Fine-grained token limited to "Make calls to Inference Providers": the
+    # agent can read it, so it must not carry any other Hub permission.
+    curation_pi_hf_token: str = Field(default="")
+    curation_pi_bill_to: str = Field(default="huggingface")
+    curation_pi_model: str = Field(default="deepseek-ai/DeepSeek-V4.1-Flash-1017")
+    # Preferred router provider; the runner retries once on automatic routing.
+    curation_pi_provider: str = Field(default="novita")
+    curation_pi_thinking: str = Field(default="high")
+    curation_pi_cli_version: str = Field(default="1.3.0")
 
     # Hugging Face OAuth configuration (for "Sign in with Hugging Face")
     hf_oauth_client_id: str = Field(

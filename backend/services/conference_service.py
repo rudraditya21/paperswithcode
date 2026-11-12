@@ -7,6 +7,7 @@ from typing import Optional
 
 from sqlalchemy import asc, case, func
 from sqlalchemy.orm import Session, load_only
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend.models.conferences import (
     Conference,
@@ -33,10 +34,7 @@ from backend.utils.entity_images import load_entity_image
 from backend.utils.exceptions import DatabaseError, PaperNotFoundError
 from backend.utils.slug_utils import slugify
 from backend.services.catalog_errors import CatalogConflictError, CatalogValidationError
-from backend.services.catalog_errors import (
-    CatalogNotFoundError,
-    CatalogPersistenceError,
-)
+from backend.services.conference_deadline_service import series_of
 
 
 class ConferenceService:
@@ -67,18 +65,10 @@ class ConferenceService:
         return result
 
     def lookup_conference(self, slug: str) -> Conference:
-        try:
-            return self.get_conference(slug)
-        except PaperNotFoundError as error:
-            raise CatalogNotFoundError(str(error)) from error
+        return self.get_conference(slug)
 
     def lookup_conference_papers(self, **kwargs) -> Papers:
-        try:
-            return self.get_conference_papers(**kwargs)
-        except PaperNotFoundError as error:
-            raise CatalogNotFoundError(str(error)) from error
-        except DatabaseError as error:
-            raise CatalogPersistenceError(str(error)) from error
+        return self.get_conference_papers(**kwargs)
 
     def _get_conference_by_slug(self, slug: str) -> DBConference:
         conference = (
@@ -166,13 +156,37 @@ class ConferenceService:
                 for db_conf, paper_count in rows
             ]
             return Conferences(count=len(results), results=results)
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve conferences: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve conferences: {str(e)}") from e
+
+    def _upcoming_tba_editions(
+        self, *, tracked_series: set[str], exclude_ids
+    ) -> list[DBConference]:
+        """Announced editions of tracked series whose deadlines are not out yet.
+
+        Only editions with official conference dates that have not ended count,
+        so old conference pages without deadlines stay off /ai-deadlines.
+        """
+        candidates = (
+            self.db.query(DBConference)
+            .filter(DBConference.start_date.isnot(None))
+            .filter(
+                func.coalesce(DBConference.end_date, DBConference.start_date)
+                >= date.today()
+            )
+            .filter(DBConference.id.notin_(exclude_ids))
+            .order_by(DBConference.start_date, DBConference.slug)
+            .all()
+        )
+        return [c for c in candidates if series_of(c.slug) in tracked_series]
 
     def get_conference_deadlines(self) -> ConferenceDeadlines:
-        """Return every conference that has at least one deadline.
+        """Return every conference with deadlines, plus announced TBA editions.
 
-        Each conference carries its full deadline list plus the metadata
+        A TBA edition belongs to a series that already has deadlines on the
+        page and has official dates but no deadlines yet; it comes last with an
+        empty deadline list. Each conference carries its full deadline list
+        plus the metadata
         (tier, tags, country, city, venue, dates) needed by the
         /ai-deadlines page. Filtering/sorting is done client-side.
         """
@@ -197,6 +211,10 @@ class ConferenceService:
                 .filter(DBConference.id.in_(deadlines_by_conf.keys()))
                 .all()
             )
+            tba_editions = self._upcoming_tba_editions(
+                tracked_series={series_of(c.slug) for c in conferences} - {None},
+                exclude_ids=deadlines_by_conf.keys(),
+            )
 
             results = [
                 self._conference_to_api(
@@ -209,18 +227,22 @@ class ConferenceService:
             # Order conferences by their earliest deadline so the default
             # (chronological) listing is stable before client-side sorting.
             results.sort(key=lambda c: min(d.deadline_at for d in c.deadlines))
+            results.extend(
+                self._conference_to_api(conf, paper_count=0, deadlines=[])
+                for conf in tba_editions
+            )
             return ConferenceDeadlines(count=len(results), results=results)
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve conference deadlines: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(
+                f"Failed to retrieve conference deadlines: {str(e)}"
+            ) from e
 
     def get_conference(self, slug: str) -> Conference:
         try:
             conference = self._get_conference_by_slug(slug)
             return self._conference_to_api(conference)
-        except PaperNotFoundError:
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve conference: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve conference: {str(e)}") from e
 
     OUTSTANDING_AWARDS = ("outstanding", "honorable_mention")
     BEST_PAPER_FINALIST_AWARD = "best_paper_finalist"
@@ -327,12 +349,10 @@ class ConferenceService:
                 ),
                 results=results,
             )
-        except PaperNotFoundError:
-            raise
-        except Exception as e:
+        except SQLAlchemyError as e:
             raise DatabaseError(
                 f"Failed to retrieve conference areas with tasks: {str(e)}"
-            )
+            ) from e
 
     def get_conference_papers(
         self,
@@ -453,7 +473,7 @@ class ConferenceService:
                     paper.conference_award = award_by_paper_id.get(int(paper.id))
 
             return result
-        except PaperNotFoundError:
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve conference papers: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(
+                f"Failed to retrieve conference papers: {str(e)}"
+            ) from e

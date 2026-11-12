@@ -2,11 +2,13 @@
 
 import React, { useEffect, useRef, useState } from "react";
 
+import { DictationButton } from "@/components/chat/DictationButton";
 import { PaperMentionPicker } from "@/components/chat/PaperMentionPicker";
 import { PaperMentionHighlights } from "@/components/chat/PaperMentionHighlights";
 import { PaperSelectionCard } from "@/components/chat/PaperSelectionCard";
 import { ArrowUpIcon, Spinner } from "@/components/chat/icons";
-import ModelPicker, { type ModelPickerOption } from "@/components/chat/ModelPicker";
+import { completedScrollHeight, isCompletionKey, useChatCompletion } from "@/components/chat/useChatCompletion";
+import { useComposerDictation } from "@/components/chat/useComposerDictation";
 import { usePaperMentions } from "@/components/chat/usePaperMentions";
 import type { ChatDraft } from "@/lib/chat";
 import { emptyChatDraft } from "@/lib/paperSelection";
@@ -19,9 +21,6 @@ interface ComposerProps {
   draft?: ChatDraft;
   onDraftChange?: (value: ChatDraft) => void;
   onStop?: () => void;
-  models?: ModelPickerOption[];
-  selectedModel?: string;
-  onModelChange?: (model: string) => void;
   disabled?: boolean;
   describedBy?: string;
   paperMentionsEnabled?: boolean;
@@ -33,7 +32,7 @@ const EMPTY_DRAFT: ChatDraft = emptyChatDraft();
 
 const Composer: React.FC<ComposerProps> = ({
   onSend, busy, placeholder, autoFocus, draft, onDraftChange, onStop,
-  models = [], selectedModel, onModelChange, disabled = false, describedBy,
+  disabled = false, describedBy,
   paperMentionsEnabled = false,
   paperSelectionEnabled = true,
   paperArtifactsEnabled = false,
@@ -52,14 +51,28 @@ const Composer: React.FC<ComposerProps> = ({
     enabled: paperMentionsEnabled,
     textareaRef: ref,
   });
+  // Enter while dictating finishes the recording, then sends the final text.
+  const sendAfterDictation = useRef(false);
+  const [sendQueued, setSendQueued] = useState(false);
+  const dictation = useComposerDictation({
+    draft: value,
+    onChange: change,
+    textareaRef: ref,
+    onEnd: (cancelled) => {
+      if (sendAfterDictation.current && !cancelled) setSendQueued(true);
+      sendAfterDictation.current = false;
+    },
+  });
+  const slashCommandOpen = paperArtifactsEnabled && value.text === "/";
+  const { completion, trackCaret } = useChatCompletion(value, mentions.open || slashCommandOpen);
 
   useEffect(() => {
     const el = ref.current;
     if (el) {
       el.style.height = "auto";
-      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+      el.style.height = `${Math.min(completedScrollHeight(el), 200)}px`;
     }
-  }, [value.text]);
+  }, [value.text, completion]);
 
   useEffect(() => { if (autoFocus) ref.current?.focus(); }, [autoFocus]);
 
@@ -79,9 +92,22 @@ const Composer: React.FC<ComposerProps> = ({
     onSend(normalized);
   };
 
+  useEffect(() => {
+    if (!sendQueued) return;
+    setSendQueued(false);
+    submit();
+    // submit reads the draft rendered with the final transcript.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sendQueued]);
+
   const selectionBlocked = Boolean(value.paperSelection) && !paperSelectionEnabled;
-  const canSend = Boolean(value.text.trim()) && !selectionBlocked;
-  const slashCommandOpen = paperArtifactsEnabled && value.text === "/";
+  const canSend = dictation.active
+    ? dictation.phase === "recording" && !selectionBlocked
+    : Boolean(value.text.trim()) && !selectionBlocked;
+  const sendAfterRecording = () => {
+    sendAfterDictation.current = true;
+    dictation.finish();
+  };
 
   return (
     <div
@@ -105,24 +131,48 @@ const Composer: React.FC<ComposerProps> = ({
         </div>
       )}
       <div className="chat-composer-textarea-wrap">
-        <PaperMentionHighlights text={value.text} mentions={value.paperMentions} scrollTop={scrollTop} />
+        <PaperMentionHighlights text={value.text} mentions={value.paperMentions} scrollTop={scrollTop} completion={completion} />
         <textarea
           className="ph-no-capture"
           data-ph-no-autocapture="true"
           data-ph-no-capture="true"
           ref={ref}
           rows={1}
+          readOnly={dictation.active}
           value={value.text}
           placeholder={placeholder || (value.paperSelection ? "Ask about this selection…" : "Ask anything about research…")}
-          onChange={(event) => mentions.updateText(event.target.value, event.target.selectionStart)}
-          onSelect={(event) => mentions.refresh(event.currentTarget.selectionStart)}
-          onClick={(event) => mentions.refresh(event.currentTarget.selectionStart)}
+          onChange={(event) => {
+            mentions.updateText(event.target.value, event.target.selectionStart);
+            trackCaret(event.target);
+          }}
+          onSelect={(event) => {
+            mentions.refresh(event.currentTarget.selectionStart);
+            trackCaret(event.currentTarget);
+          }}
+          onClick={(event) => {
+            mentions.refresh(event.currentTarget.selectionStart);
+            trackCaret(event.currentTarget);
+          }}
           onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
           onBlur={(event) => {
             if (!event.relatedTarget?.closest?.(".chat-paper-picker, .chat-slash-command")) window.setTimeout(mentions.close, 0);
           }}
           onKeyDown={(event) => {
+            if (dictation.active) {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                if (canSend && !busy && !disabled) sendAfterRecording();
+              }
+              return;
+            }
             if (mentions.keyDown(event)) return;
+            if (isCompletionKey(event) && completion) {
+              event.preventDefault();
+              const text = value.text + completion;
+              mentions.updateText(text, text.length);
+              window.requestAnimationFrame(() => ref.current?.setSelectionRange(text.length, text.length));
+              return;
+            }
             if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
               event.preventDefault();
               submit();
@@ -163,14 +213,17 @@ const Composer: React.FC<ComposerProps> = ({
         )}
       </div>
       {mentions.message && <div id="chat-paper-mention-message" className="chat-paper-mention-message" role="alert">{mentions.message}</div>}
+      {dictation.error && <div className="chat-paper-mention-message" role="alert">{dictation.error}</div>}
       <div className="chat-composer-row">
         <div className="chat-composer-tools">
-          {models.length > 0 && selectedModel && onModelChange && <ModelPicker models={models} selectedModel={selectedModel} onModelChange={onModelChange} disabled={busy} />}
-          <span className="chat-composer-hint">Enter to send · Shift+Enter for newline</span>
+          <span className="chat-composer-hint">{completion ? "Tab to complete · " : ""}Enter to send · Shift+Enter for newline</span>
         </div>
-        <button type="button" className={`chat-send${(busy || canSend) ? " chat-send-on" : ""}`} onClick={busy ? onStop : submit} disabled={disabled || (busy ? !onStop : !canSend)} aria-label={busy ? "Stop generating" : "Send message"}>
-          {busy ? (onStop ? <span aria-hidden="true">■</span> : <Spinner light />) : <ArrowUpIcon />}
-        </button>
+        <div className="chat-composer-actions">
+          <DictationButton dictation={dictation} disabled={disabled} />
+          <button type="button" className={`chat-send${(busy || canSend) ? " chat-send-on" : ""}`} onClick={busy ? onStop : dictation.active ? sendAfterRecording : submit} disabled={disabled || (busy ? !onStop : !canSend)} aria-label={busy ? "Stop generating" : "Send message"}>
+            {busy ? (onStop ? <span aria-hidden="true">■</span> : <Spinner light />) : <ArrowUpIcon />}
+          </button>
+        </div>
       </div>
     </div>
   );

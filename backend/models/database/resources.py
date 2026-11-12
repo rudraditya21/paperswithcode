@@ -1,13 +1,15 @@
 """Repository, Hugging Face artifact, project page, and model release persistence models."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING, List, Optional
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -397,6 +399,29 @@ class PaperXThread(Base):
     )
 
 
+class PaperXTrending(Base):
+    """A paper on one day's "AI Papers on X" sheet, with its top post's reach."""
+
+    __tablename__ = "paper_x_trending"
+
+    shared_on: Mapped[date] = mapped_column(Date, primary_key=True)
+    paper_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("papers.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    post_url: Mapped[Optional[str]] = mapped_column(String(500))
+    post_author: Mapped[Optional[str]] = mapped_column(String(64))
+    like_count: Mapped[Optional[int]] = mapped_column(Integer)
+    repost_count: Mapped[Optional[int]] = mapped_column(Integer)
+    view_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class PaperXThreadScan(Base):
     """Bounded X search state for one paper, kept by the discovery CRON."""
 
@@ -413,6 +438,28 @@ class PaperXThreadScan(Base):
         JSONB, nullable=False, server_default=text("'[]'")
     )
     linked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class XPostMetrics(Base):
+    """Like velocity of one linked X post, refreshed during its first week."""
+
+    __tablename__ = "x_post_metrics"
+
+    tweet_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    posted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    like_count: Mapped[Optional[int]] = mapped_column(Integer)
+    # Smoothed likes per hour (EMA over readings).
+    like_velocity: Mapped[Optional[float]] = mapped_column(Float)
+    last_read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # "syndication" or "api".
+    last_source: Mapped[Optional[str]] = mapped_column(String(16))
+    read_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # NULL once the reading schedule is finished or the post is gone.
+    next_read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    gone_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class PaperXPost(Base):

@@ -78,16 +78,6 @@ For every managed leaderboard sync, fetch the current upstream source read-only 
 - **Contract:** `embedding-models` / `mmteb-v2`, `MMTEB Score`, official MMTEB v2 source, and only rows with the managed MMTEB methodology.
 - **Proof:** Apply the shared procedure to the complete overall cohort. Verify model identity, unique contiguous ranks, finite scores, managed-row ownership, and the public embedding-models leaderboard read.
 
-## `sync_mmteb_retrieval`
-
-- **Contract:** `retrieval` / `mmteb-v2`, `Retrieval`, official MMTEB v2 source, and only managed MMTEB rows.
-- **Proof:** Apply the shared procedure independently of the overall lane. Verify retrieval values are not copied from aggregate scores and compare the owned row set and public retrieval leaderboard.
-
-## `sync_mmteb_reranking`
-
-- **Contract:** `text-reranking` / `mmteb-v2`, `Rerank`, official MMTEB v2 source, and only managed MMTEB rows.
-- **Proof:** Apply the shared procedure independently of the other MMTEB lanes. Verify reranking task identity, values, ranks, stale-row removal, and the public text-reranking leaderboard.
-
 ## `sync_mmeb_v2`
 
 - **Contract:** `embedding-models` / `mmeb-v2`, `MMEB-v2 Score`, official MMEB source, and only rows with the managed MMEB methodology.
@@ -127,22 +117,88 @@ For every managed leaderboard sync, fetch the current upstream source read-only 
 ## `sync_vals_finance_agent`
 
 - **Contract:** `finance-agent-v2` on task `agents`; Accuracy (%) 0–100; the single table on https://www.vals.ai/benchmarks/fabv2; typically 40–400 upstream rows, of which only reviewed labels are published (all 78 on 2026-10-16).
-- **Proof:** Diff the Vals table against managed rows (label, accuracy at two decimals); confirm `vals_finance_agent_unreviewed` labels get an identity (index the model's paper first), `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on Accuracy.
+- **Proof:** Diff the Vals table against managed rows (label, accuracy at two decimals); confirm `sync_vals_finance_agent_unreviewed` labels become radar signals or get an identity in `vals_finance_agent_sync_service.py`, reviewer notes beneath each managed head survived, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on Accuracy.
 
 ## `sync_surge_chartography`
 
 - **Contract:** `chartography-no-tools` on task `image-understanding`; Pass@1 0–1 (Surge percent / 100); the "Chartography Leaderboard" block on https://surgehq.ai/benchmarks/chartography (fetch with a browser User-Agent); typically 25–400 upstream rows, of which only reviewed labels are published (41 of 42 on 2026-10-17; DeepSeek V4 Flash Vision (experimental) is excluded on purpose).
-- **Proof:** Diff the Surge block against managed rows (label, percent at one decimal); confirm `surge_chartography_unreviewed` labels get an identity (index the model's paper first), `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); confirm the with-tools `chartography` benchmark was not touched.
+- **Proof:** Diff the Surge block against managed rows (label, percent at one decimal); confirm `sync_surge_chartography_unreviewed` labels become radar signals or get an identity in `surge_chartography_sync_service.py`, reviewer notes beneath each managed head survived, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); confirm the with-tools `chartography` benchmark was not touched.
+
+## `sync_swe_marathon`
+
+- **Contract:** `swe-marathon` on task `long-horizon-agents`; Resolution Rate (%) 0–100 = trials with reward 1 / all trials of a complete v1.1 run (20 tasks x 8 trials), best reasoning effort per model and agent, from the `{version:`v1.1`,tasks:JSON.parse(...)}` block in the `/assets/index-*.js` bundle that https://www.swe-marathon.org/ loads; typically 10–300 complete runs (29 on 2026-11-10).
+- **Proof:** Recompute a few rows from the bundle (the tweet/site rounds to one decimal: 53.75 shows as 53.8); confirm `sync_swe_marathon_unreviewed` names become radar signals or get an identity in `swe_marathon_sync_service.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated; a failure naming result versions means Abundant published a new benchmark version, which needs a reviewer decision (new benchmark row), not a parser patch.
+
+## `sync_jevbench`
+
+- **Contract:** `jevbench` on task `decision-making`; Composite Score 0–100 (two decimals) of every ranked row on Benchmark Heaven's official API board (`api_board_rank` set, method v1.7), from https://benchmarkheaven.com/api/jevbench/latest; ranks match https://benchmarkheaven.com/jev-models/api; typically 20–300 ranked API rows (48 on 2026-11-12, 6 on catalog papers).
+- **Proof:** Compare managed rows' relative order and values with the API board; confirm `sync_jevbench_unreviewed` names become radar signals (vendor from the source host) or get an identity in `jevbench_sync_service.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated; a failure naming the method means Benchmark Heaven restated scores on a new method, which needs a reviewer decision before bumping `METHOD`, not a parser patch.
 
 ## `sync_frontiercs_2`
 
 - **Contract:** `frontiercs-2` on task `coding-agents`; Pass Rate (%) 0–100 (best metric) and FCI (unbounded, Kimi K2.7 = 0); the `MODELS`/`PASS`/`ECI` constants in https://frontier-cs.org/assets/js/fcs2-data.js behind https://frontier-cs.org/#leaderboard; typically 8–200 entries, one per model and harness (14 on 2026-10-26, all reviewed).
 - **Proof:** Diff the data file against managed rows (model, harness, pass rate, FCI); confirm `frontiercs_2_unreviewed` names get an identity (index the model's paper first), `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on Pass Rate.
 
+## `sync_vals_index`
+
+- **Contract:** `vals-index-v2-2` on task `agents`; Accuracy (%) 0–100; the single ranked table at https://www.vals.ai/benchmarks/vals_index; typically 15–400 rows (29 on 2026-10-29).
+- **Proof:** Diff the upstream rows against managed rows; confirm `sync_vals_index_unreviewed` names become radar signals or get an identity in `carbon_board_identities.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on the board metric.
+
+## `sync_swe_sweep`
+
+- **Contract:** `swe-sweep` on task `coding-agents`; Resolved (%) 0–100 from the site's 0–1 score, harness mini-SWE-agent; the inline results array behind https://swesweep.com/; typically 5–200 rows (13 on 2026-10-29, `Astra 6` excluded as a partial run).
+- **Proof:** Diff the upstream rows against managed rows; confirm `sync_swe_sweep_unreviewed` names become radar signals or get an identity in `carbon_board_identities.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on the board metric.
+
+## `sync_vending_bench_2`
+
+- **Contract:** `vending-bench-2` on task `long-horizon-agents`; Bank Balance ($) unbounded (mean final balance); `runs.vb2[*].final_value` in the hashed SvelteKit data chunk imported by https://andonlabs.com/evals/vending-bench-2 (the page table shows only the top 10); typically 20–400 models (73 on 2026-10-29).
+- **Proof:** Diff the upstream rows against managed rows; confirm `sync_vending_bench_2_unreviewed` names become radar signals or get an identity in `carbon_board_identities.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on the board metric.
+
+## `sync_blueprint_bench_2`
+
+- **Contract:** `blueprint-bench-2` on task `spatial-understanding`; Similarity Score 0–1 (random = 0); the score table at https://andonlabs.com/evals/blueprint-bench-2, skipping `Human*` and `0.000**` floor rows; typically 10–300 rows (30 on 2026-10-29).
+- **Proof:** Diff the upstream rows against managed rows; confirm `sync_blueprint_bench_2_unreviewed` names become radar signals or get an identity in `carbon_board_identities.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on the board metric.
+
+## `sync_riemann_bench`
+
+- **Contract:** `riemann-bench` on task `math`; Pass@1 0–1 from the visible percentage; the "Riemann-bench Leaderboard" block at https://surgehq.ai/benchmarks/riemann-bench (Chartography layout, empty `data-score`); typically 15–400 rows (44 on 2026-10-29; 21 since the v1.1 answer-key re-run on 2026-11-02, after which the 32 v1.0-only rows were deleted).
+- **Proof:** Diff the upstream rows against managed rows; confirm `sync_riemann_bench_unreviewed` names become radar signals or get an identity in `carbon_board_identities.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on the board metric.
+
+## `sync_cwe_bench`
+
+- **Contract:** `cwe-bench-v2` on task `cybersecurity`; Pass@1 over all 250 tasks (programmatic verifier), harness from "run in …"; the `CWE-bench v2 leaderboard` JSON-LD ItemList on https://cwe-bench.com/; typically 5–200 items (11 on 2026-11-06). Since 2026-11-02 `cwe-bench-v1` is a frozen snapshot (archive at https://cwe-bench.com/v1) and is not synced.
+- **Proof:** Diff the upstream rows against managed rows; confirm `sync_cwe_bench_unreviewed` names become radar signals or get an identity in `carbon_board_identities.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on the board metric.
+
+## `sync_exploitgym`
+
+- **Contract:** `exploitgym` on task `cybersecurity`; Success Rate (%) 0–100 = on_target / instances.total, harness from `agent`; https://www.cybergym.io/assets/data/exploitgym.json, keeping only full-set `6h timeout` / `rescaled 6h timeout` rows (v1 or unversioned); typically 4–200 rows (9 on 2026-10-29).
+- **Proof:** Diff the upstream rows against managed rows; confirm `sync_exploitgym_unreviewed` names become radar signals or get an identity in `carbon_board_identities.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on the board metric.
+
+
+## `sync_cybergym`
+
+- **Contract:** `cybergym` on task `cybersecurity`; Success Rate (%) 0–100 = `score_10` × 100, harness from `agent`; https://www.cybergym.io/assets/data/cybergym.json `level1`, keeping the site's default view (single trial, not hidden or held back by `visible_after`, `focus` model, no `dynamic` / `test-time mem.` features); typically 20–300 rows (44 on 2026-10-29, 32 reviewed).
+- **Proof:** Diff the upstream rows against managed rows; confirm `sync_cybergym_unreviewed` names become radar signals or get an identity in `carbon_board_identities.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on the board metric.
+
+## `sync_patcheval_verified`
+
+- **Contract:** `patcheval-verified` on task `cybersecurity`; Accuracy (%) 0–100 = repaired / 230, harness from the Agent column (codex → Codex, Opencode → OpenCode, trae → Trae CLI); the "Results on PatchEval-Verified" table in https://raw.githubusercontent.com/bytedance/PatchEval/main/README.md; typically 5–200 rows (9 on 2026-10-29).
+- **Proof:** Same as `sync_cybergym`; the hand-imported FrogNano row (Leaf harness) is not upstream and stays unmanaged.
+
+## `sync_critpt` and `sync_critpt_v2`
+
+- **Contract:** `critpt` and `critpt-v2` on task `scientific-reasoning`; Accuracy (%) 0–100 = the model record's `critpt` (original dataset, no harness) or `critptAgentic` (v2, code-execution sandbox) × 100, read from the Next.js data embedded in https://artificialanalysis.ai/evaluations/critpt and /critpt-v2 (charted models only; not the Data API, so no API quota); typically 15–300 rows (27 and 28 on 2026-11-05). K2 Horizon, Nemotron 3.5 Super VL and Beam are excluded on `critpt` because their self-reported rows stay.
+- **Proof:** Same as `sync_cybergym`; older hand-imported Artificial Analysis rows for models AA no longer charts stay unmanaged.
+
+## `sync_terminal_bench_science`
+
+- **Contract:** `terminal-bench-science-0-1` on task `scientific-reasoning`; Accuracy (%) 0–100 = the model record's `terminalBenchScience` × 100 from the Next.js data in https://artificialanalysis.ai/evaluations/terminal-bench-science; harness `mini-SWE-agent` (AA runs all 70 tasks with mini-swe-agent, pass@1 over three repeats); typically 15–300 rows (28 on 2026-11-05). `adopt_unmanaged=False`: vendor rows (Claude Code, unnamed harness) are never overwritten, so a model can have one row per harness.
+- **Proof:** Same as `sync_cybergym`.
+
 ## `sync_physics_iq_verified`
 
 - **Contract:** `physics-iq-verified` on task `video-generation`; Physics-IQ Verified Score (I2V) and (V2V), 0–100; Verified table of the official `google-deepmind/physics-IQ-benchmark` README; typically 30–300 upstream rows, of which only reviewed labels are published (33 on 2026-10-13), one per model and track.
-- **Proof:** Diff the README table against managed rows (label, track, score at README precision, ± SD, date added); confirm `physics_iq_verified_unreviewed` warnings are either mapped or covered by the exclusion rules, `missing_papers` is empty, and `missing_upstream` rows were investigated (they are never deleted automatically); verify ranks on both metrics.
+- **Proof:** Diff the README table against managed rows (label, track, score at README precision, ± SD, date added); confirm `sync_physics_iq_verified_unreviewed` warnings become radar signals, get an identity, or are covered by the exclusion rules; reviewer notes beneath each managed head survived, `missing_papers` is empty, and `missing_upstream` rows were investigated (they are never deleted automatically); verify ranks on both metrics.
 
 ## `sync_frontiercode`
 
@@ -185,6 +241,13 @@ For every managed leaderboard sync, fetch the current upstream source read-only 
 - **Independent proof:** Open one matched post from the JSON and confirm it is a paper author or the paper's own organization (business-verified account) introducing that paper, never an outside account; with apply on, confirm the paper page's X threads card shows it.
 - **Correctness:** `X search HTTP 401/403` means a bad or unentitled token and `429` an exhausted quota (the run stops at the first one). A zero `papers_scanned` means every recent candidate already has threads or used its three scans.
 
+## `refresh_x_post_likes`
+
+- **Effect:** Hourly at :35, adds an `x_post_metrics` row for every `paper_x_threads` post from the last 7 days, then reads each due post (about 1, 2, 4, 8, 12, 24, 48, 72, 120 and 144 h after posting) and updates its likes-per-hour EMA (`like_velocity`). Syndication is tried first; posts it cannot serve use the paid X API (`X_API_BEARER_TOKEN`), capped at `PWC_X_LIKES_API_DAILY_CAP` (default 300) posts per UTC day, tracked in `x_post_likes_api_usage.json` under `PWC_CRON_LOCK_DIR`. Posts the API reports unavailable get `gone_at`. Report-only (reads through syndication and rolls back) unless `PWC_X_LIKES_APPLY=true`.
+- **Freshness metrics** (dashboard Database Metrics): `last_write` = latest `x_post_metrics.last_read_at`, `tracked_posts` = posts with a pending reading. Report-only runs write nothing, so both stay empty until apply is on.
+- **Independent proof:** Pick a recently read post (`ORDER BY last_read_at DESC`), open it on X, and confirm its like count is close to `like_count`; then confirm the paper's `x_trending_component` is set after the next `calculate_paper_trending_scores` run.
+- **Correctness:** The JSON summary lists `syndication_reads`, `api_reads`, `api_reads_today`, `unread` and `api_error`. `api_error` with HTTP 401/402 means a bad token or exhausted X credits and exits 1; many `unread` with `api_reads_today` at the cap means syndication is failing and the cap is doing its job. The X part only affects rankings when `PWC_TRENDING_X_WEIGHT` in `/etc/paperswithcode/trending-cron.env` is above 0, and then it can only lift a paper: the score is the higher of the GitHub/HF score and 100 × weight × `x_trending_component`.
+
 ## `link_google_scholar_profiles`
 
 - **Effect:** Checks Wikidata Scholar-ID candidates (P1960) for authors with 3+ papers: each new author once on Semantic Scholar (ORCID / S2 author ID on 15 sampled papers) into `author_google_scholar_candidates`, then spends the SerpAPI searches left this month (minus 10) reading Scholar profiles of S2-matched candidates, largest authors first, and upserts confirmed links into `author_google_scholar_profiles`; never deletes links.
@@ -200,7 +263,7 @@ For every managed leaderboard sync, fetch the current upstream source read-only 
 
 ## `enqueue_benchmark_gap_review`
 
-- **Effect:** Once per UTC day queues one `review-benchmark-gaps` overseer job when candidates reported by at least three papers are waiting, plus `add-benchmark` jobs for approved candidates up to 20 per day. Both run on the shared curation queue (trigger `benchmark-gap-cron`, at most two active) and respect the scheduler pause; promotions requeue add-evals for the evidence papers. `--status` prints candidate counts by status and today's creation jobs.
+- **Effect:** Once per UTC day queues one `review-benchmark-gaps` overseer job when candidates reported by at least three papers are waiting, plus `add-benchmark` jobs for approved candidates up to 20 per day. Both run on the shared curation queue (trigger `benchmark-gap-cron`, at most two active) and respect the scheduler pause; promotions requeue add-evals for the evidence papers. The JSON's `new_benchmark_rechecks` lists add-evals it queued (policy `new-benchmark-<dataset id>`, at most 5 per benchmark, 20 per run, two active) for papers whose stored Markdown names a leaderboard created in the last two days; `unscanned_dataset_ids` hit the 400-read budget and retry next day. `--status` prints candidate counts by status and today's creation jobs.
 - **Independent proof:** Compare `benchmark_curation_candidates` status counts and `reviewed_at` with the latest `review-benchmark-gaps` job's `mutation_result`; open one promoted candidate's `resolution.dataset_id` on the live site and confirm the leaderboard, source paper, and primary metric.
 - **Correctness:** A review job that never applies leaves `reviewed_at` stale while eligible candidates exist. Repeated `add-benchmark` failures back a candidate off 3 days, then return it to review after two failures. Roll back a wrong benchmark with `POST /api/v1/admin/codex-curation/jobs/benchmark-candidates/<id>/rollback`.
 
@@ -224,20 +287,6 @@ For every managed leaderboard sync, fetch the current upstream source read-only 
 - **Independent proof:** `curl https://paperswithcode.co/api/v1/papers/<id>/suggested-questions` for a top home-feed paper returns three questions within ~0.2 s (stored, not generated).
 - **Correctness:** `remaining` should reach 0 after a few runs and stay near 0; a persistent `failed` count with `suggested_questions_failed` warnings means OpenAI errors (key, quota, or model name).
 - **Dashboard evidence:** `visible_missing` of `visible_papers` = the top 90 trending latest papers of the past week (an approximation of the home feed's three pages) without a `paper_suggested_questions` row. Zero is healthy even with no recent writes; more than 5 degrades. The task/method part of the cohort needs the probe above.
-
-## `post_trending_paper_to_x`
-
-- **Effect:** Prints a JSON summary (`paper_id`, `text`, `url`, `post_id`, `reply_id`, `errors`) and inserts one `paper_x_posts` row per post. Posts at most one paper per run: the top `trending_score` arXiv paper from the last 14 days with a TL;DR that was never posted. Exits 0 with an `x_trending_post_skipped` warning (dry run) when the `X_POST_*` OAuth 1.0a keys are unset, and 1 only when candidates existed but none could be fetched and rendered.
-- **Independent proof:** Open `https://x.com/i/status/<post_id>` and confirm the first-page image, title, TL;DR, and the paper link reply.
-- **Correctness:** `X HTTP 401` means bad keys, `403` a read-only app or a post over the account's length limit (`PWC_X_POST_MAX_CHARS`), `402` exhausted credits. A null `paper_id` without errors means every recent trending paper was already posted.
-- **Dashboard evidence:** latest `paper_x_posts.posted_at` and posts in 24 h. Six runs a day normally post several papers, so a day without a post degrades the job; confirm with `SELECT posted_at, paper_id FROM paper_x_posts ORDER BY posted_at DESC LIMIT 10` before blaming X.
-
-## `post_x_insight`
-
-- **Effect:** Prints a JSON summary (`kind`, `subject_key`, `text`, `template`, `url`, `post_id`, `reply_id`, `tried`) and inserts one `x_insight_posts` row per post. A null `kind` means no tried kind had anything new (healthy). An `x_insight_rewrite_rejected` warning means Luna changed a number and the template was posted instead.
-- **Independent proof:** Open `https://x.com/i/status/<post_id>`; check the numbers against the linked benchmark, method, or task page.
-- **Correctness:** Same X errors as `post_trending_paper_to_x` (shared `X_POST_*` keys and credits). A SOTA post must name a paper published in the last 45 days that leads a leaderboard with at least 5 entries.
-- **Dashboard evidence:** latest `x_insight_posts.posted_at` and posts in 72 h; a quiet run is healthy, so only three days without any insight degrade. Check `SELECT kind, max(posted_at), count(*) FROM x_insight_posts GROUP BY kind` for a kind that stopped posting.
 
 ## `scan_model_releases`
 

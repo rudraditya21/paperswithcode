@@ -1,8 +1,13 @@
-"""Refresh paper-linked Artificial Analysis language and TTS evaluations."""
+"""Refresh paper-linked Artificial Analysis language, TTS, and Decision Index evaluations."""
 
 import argparse
 
 from backend.database.connection import db_manager
+from backend.services.artificial_analysis_decision_sync_service import (
+    DecisionIndexSyncService,
+    fetch_decision_index_leaderboard,
+    run_decision_discovery,
+)
 from backend.services.artificial_analysis_sync_service import (
     ArtificialAnalysisSyncService,
     fetch_artificial_analysis_leaderboard,
@@ -28,6 +33,11 @@ class SyncArtificialAnalysisJob(CronJobBase):
             leaderboard.quota_remaining,
             leaderboard.quota_limit,
         )
+        if leaderboard.withdrawn_indexes:
+            self.logger.warning(
+                "artificial_analysis_withdrawn_indexes %s (rows kept)",
+                ",".join(leaderboard.withdrawn_indexes),
+            )
         session = db_manager.session_local()
         try:
             discovery = run_discovery(
@@ -56,10 +66,28 @@ class SyncArtificialAnalysisJob(CronJobBase):
                 commit=not self.dry_run,
             )
             self.logger.info("artificial_analysis_tts_sync %s", tts_stats.to_dict())
+            # Last, so a Decision Index page change cannot block the others.
+            decision_leaderboard = fetch_decision_index_leaderboard()
+            decision_discovery = run_decision_discovery(
+                session, persist=not self.dry_run
+            )
             self.logger.info(
-                "Papers processed: language=%s tts=%s",
+                "artificial_analysis_decision_discovery %s",
+                decision_discovery.to_dict(),
+            )
+            decision_stats = DecisionIndexSyncService(session).sync(
+                decision_leaderboard,
+                discovery=decision_discovery,
+                commit=not self.dry_run,
+            )
+            self.logger.info(
+                "artificial_analysis_decision_sync %s", decision_stats.to_dict()
+            )
+            self.logger.info(
+                "Papers processed: language=%s tts=%s decision=%s",
                 stats.matched,
                 tts_stats.matched,
+                decision_stats.matched,
             )
         finally:
             session.close()

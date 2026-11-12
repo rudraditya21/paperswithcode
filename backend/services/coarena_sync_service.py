@@ -11,14 +11,17 @@ import httpx
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
-    Dataset,
     Evaluation,
-    Metric,
     Paper,
-    Task,
-    TaskDatasetMetric,
 )
 from backend.services.evaluation_service import EvaluationService
+from backend.services.leaderboard_model_matching_service import (
+    LeaderboardModel,
+    LeaderboardModelMatcher,
+)
+from backend.services.leaderboard_sync_catalog import (
+    resolve_leaderboard,
+)
 from backend.services.leaderboard_sync_ownership import managed_methodology_prefix
 
 COARENA_ENDPOINT = "https://coarena.ai/api/leaderboard"
@@ -70,6 +73,12 @@ MODEL_PAPER_IDENTITIES: dict[str, PaperIdentity] = {
     ),
     "gpt-6-1-sol": PaperIdentity(
         source_url="https://openai.com/index/introducing-gpt-6-1-sol/", is_open=False
+    ),
+    "gpt-6-1-terra": PaperIdentity(
+        source_url="https://openai.com/index/introducing-gpt-6-1-terra", is_open=False
+    ),
+    "kimi-k3-1-pro": PaperIdentity(
+        source_url="https://www.kimi.com/blog/kimi-k3-1-pro", is_open=True
     ),
     "opus-5-5": PaperIdentity(
         source_url="https://www.anthropic.com/claude-opus-5-5", is_open=False
@@ -161,6 +170,7 @@ class CoArenaSyncStats:
     created: int = 0
     updated: int = 0
     deleted: int = 0
+    auto_matched: list[str] = field(default_factory=list)
     unmatched_models: list[str] = field(default_factory=list)
     missing_papers: list[str] = field(default_factory=list)
 
@@ -171,6 +181,7 @@ class CoArenaSyncStats:
             "created": self.created,
             "updated": self.updated,
             "deleted": self.deleted,
+            "auto_matched": self.auto_matched,
             "unmatched_models": self.unmatched_models,
             "missing_papers": self.missing_papers,
         }
@@ -292,27 +303,6 @@ class CoArenaSyncService:
     def __init__(self, db: Session):
         self.db = db
 
-    def _leaderboard_identity(self) -> tuple[Task, Dataset]:
-        task = self.db.query(Task).filter(Task.slug == TASK_SLUG).one_or_none()
-        dataset = (
-            self.db.query(Dataset).filter(Dataset.slug == DATASET_SLUG).one_or_none()
-        )
-        metric = self.db.query(Metric).filter(Metric.name == METRIC_NAME).one_or_none()
-        if task is None or dataset is None or metric is None:
-            raise RuntimeError("CoArena task, benchmark, or metric is not configured")
-        configured = (
-            self.db.query(TaskDatasetMetric)
-            .filter(
-                TaskDatasetMetric.task_id == task.id,
-                TaskDatasetMetric.dataset_id == dataset.id,
-                TaskDatasetMetric.metric_id == metric.id,
-            )
-            .one_or_none()
-        )
-        if configured is None:
-            raise RuntimeError("CoArena leaderboard metric is not linked to the task")
-        return task, dataset
-
     def sync(
         self,
         entries: list[CoArenaEntry],
@@ -328,7 +318,9 @@ class CoArenaSyncService:
         stats = CoArenaSyncStats(fetched=len(entries))
 
         try:
-            task, dataset = self._leaderboard_identity()
+            task, dataset = resolve_leaderboard(
+                self.db, "CoArena", TASK_SLUG, DATASET_SLUG, (METRIC_NAME,)
+            )
             arxiv_ids = {
                 identity.arxiv_id
                 for identity in MODEL_PAPER_IDENTITIES.values()
@@ -370,22 +362,44 @@ class CoArenaSyncService:
                 self._managed_model_id(row.methodology): row for row in managed_rows
             }
             upstream_ids = {entry.id for entry in entries}
+            # Models without a reviewed identity go to the shared matcher; the
+            # rest become release-radar signals under their CoArena company.
+            unknown = {
+                entry.id: LeaderboardModel(entry.name, entry.company or "")
+                for entry in entries
+                if entry.id not in MODEL_PAPER_IDENTITIES
+            }
+            matcher = LeaderboardModelMatcher(
+                self.db,
+                provider="coarena",
+                leaderboard_name="CoArena",
+                leaderboard_url=COARENA_SOURCE_URL,
+            )
+            auto_matched = matcher.match(list(unknown.values()))
 
             for entry in entries:
                 identity = MODEL_PAPER_IDENTITIES.get(entry.id)
+                hf_model_url = None
                 if identity is None:
-                    stats.unmatched_models.append(entry.id)
-                    continue
-                paper_id = (
-                    papers_by_arxiv.get(identity.arxiv_id)
-                    if identity.arxiv_id
-                    else papers_by_source.get(identity.source_url)
-                )
-                if paper_id is None:
-                    stats.missing_papers.append(
-                        f"{entry.id}:{identity.arxiv_id or identity.source_url}"
+                    match = auto_matched.get(entry.name)
+                    if match is None:
+                        stats.unmatched_models.append(entry.id)
+                        continue
+                    paper_id, is_open = match.paper_id, match.is_open
+                    hf_model_url = match.hf_model_url
+                    stats.auto_matched.append(entry.id)
+                else:
+                    paper_id = (
+                        papers_by_arxiv.get(identity.arxiv_id)
+                        if identity.arxiv_id
+                        else papers_by_source.get(identity.source_url)
                     )
-                    continue
+                    is_open = identity.is_open
+                    if paper_id is None:
+                        stats.missing_papers.append(
+                            f"{entry.id}:{identity.arxiv_id or identity.source_url}"
+                        )
+                        continue
 
                 methodology = (
                     f"{MANAGED_METHODOLOGY_PREFIX} upstream_id={entry.id}; "
@@ -410,7 +424,9 @@ class CoArenaSyncService:
                 row.methodology = methodology
                 row.metrics = {METRIC_NAME: entry.elo}
                 row.uses_additional_data = False
-                row.is_open = identity.is_open
+                row.is_open = is_open
+                if hf_model_url:
+                    row.hf_model_url = hf_model_url
                 row.best_metric = METRIC_NAME
                 row.evaluated_on = now.date()
                 row.external_source_url = COARENA_SOURCE_URL
@@ -419,6 +435,9 @@ class CoArenaSyncService:
                 row.updated_at = now
                 stats.matched += 1
 
+            matcher.report_unmatched(
+                [model for model in unknown.values() if model.name not in auto_matched]
+            )
             for row in managed_rows:
                 model_id = self._managed_model_id(row.methodology)
                 if model_id and model_id not in upstream_ids:

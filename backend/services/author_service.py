@@ -10,20 +10,24 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, asc, or_
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend.models.database import (
     Author as DBAuthor,
     AuthorAlias,
     AuthorGoogleScholarProfile,
+    AuthorPhoto,
     Organization,
     Paper as DBPaper,
     PaperAuthor,
 )
 from backend.models.papers import (
     Author,
+    AuthorPhotoInfo,
     Authors,
     Papers,
 )
+from backend.utils.author_photos import author_photo_path
 from backend.utils.exceptions import PaperNotFoundError, DatabaseError
 
 
@@ -94,6 +98,15 @@ def get_or_create_author_by_name(db: Session, name: str) -> DBAuthor:
     return author
 
 
+def merged_author_id(db: Session, author_id: int) -> Optional[int]:
+    """Return the author an ID was merged into, or None if it was not merged."""
+    return (
+        db.query(AuthorAlias.author_id)
+        .filter(AuthorAlias.alias_id == author_id)
+        .scalar()
+    )
+
+
 class AuthorService:
     """Service class for author-related operations."""
 
@@ -103,12 +116,7 @@ class AuthorService:
     def _resolve_author_id(self, author_id: str) -> int:
         """Map an author ID merged into another author to the surviving ID."""
         requested_id = int(author_id)
-        merged_into = (
-            self.db.query(AuthorAlias.author_id)
-            .filter(AuthorAlias.alias_id == requested_id)
-            .scalar()
-        )
-        return merged_into or requested_id
+        return merged_author_id(self.db, requested_id) or requested_id
 
     def get_authors(
         self,
@@ -201,8 +209,15 @@ class AuthorService:
                 results=authors,
             )
 
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve authors: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve authors: {str(e)}") from e
+
+    def get_photo(self, author_id: int, sha256: str) -> AuthorPhoto:
+        """Return the stored photo when the URL names its current version."""
+        photo = self.db.get(AuthorPhoto, author_id)
+        if photo is None or photo.sha256 != sha256:
+            raise PaperNotFoundError("Photo not available")
+        return photo
 
     def get_author_by_id(self, author_id: str) -> Author:
         """
@@ -240,6 +255,8 @@ class AuthorService:
                 .scalar()
             )
 
+            photo = self.db.get(AuthorPhoto, db_author.id)
+
             author_dict = {
                 "id": str(db_author.id),
                 "full_name": db_author.name,
@@ -249,6 +266,14 @@ class AuthorService:
                 "hf_status": db_author.hf_status,
                 "hf_is_pro": db_author.hf_is_pro or False,
                 "google_scholar_id": scholar_id,
+                "photo": photo
+                and AuthorPhotoInfo(
+                    url=author_photo_path(photo),
+                    credit=photo.credit,
+                    license=photo.license,
+                    license_url=photo.license_url,
+                    source_url=photo.source_url,
+                ),
                 "paper_count": paper_count or 0,
                 "organization_slug": organization_slug_for_author_name(
                     self.db, db_author.name
@@ -261,8 +286,8 @@ class AuthorService:
             raise
         except ValueError:
             raise PaperNotFoundError(f"Invalid author ID: {author_id}")
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve author: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve author: {str(e)}") from e
 
     def get_author_papers(
         self,
@@ -354,8 +379,8 @@ class AuthorService:
             raise
         except ValueError:
             raise PaperNotFoundError(f"Invalid author ID: {author_id}")
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve author papers: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve author papers: {str(e)}") from e
 
     def search_authors(
         self,
@@ -434,5 +459,5 @@ class AuthorService:
                 results=authors,
             )
 
-        except Exception as e:
-            raise DatabaseError(f"Failed to search authors: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to search authors: {str(e)}") from e

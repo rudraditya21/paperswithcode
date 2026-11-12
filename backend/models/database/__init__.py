@@ -87,6 +87,7 @@ from backend.models.database.chat_transcripts import (
     ChatPiPreparedFork,
     ChatHarnessAssignmentAudit,
 )
+from backend.models.database.dictation import DictationSession
 from backend.models.database.conferences import (
     Conference,
     ConferenceDeadline,
@@ -119,6 +120,7 @@ from backend.models.database.frameworks import (
     FrameworkPlatform,
     TaskFramework,
 )
+from backend.models.database.legacy_urls import LegacyPwcSlug
 from backend.models.database.identity import (
     AuthSession,
     UserBookmark,
@@ -149,6 +151,7 @@ from backend.models.database.papers import (
     Author,
     AuthorAlias,
     AuthorGoogleScholarProfile,
+    AuthorPhoto,
     PaperAuthor,
     PaperTask,
     PaperMethod,
@@ -171,8 +174,10 @@ from backend.models.database.resources import (
     PaperProjectPage,
     PaperXThread,
     PaperXPost,
+    PaperXTrending,
     XInsightPost,
     PaperXThreadScan,
+    XPostMetrics,
     PaperRepository,
 )
 from backend.models.database.taxonomy import (
@@ -185,12 +190,15 @@ from backend.models.database.taxonomy import (
 
 
 __all__ = [
+    "DictationSession",
     "ResearchFollow",
     "ResearchSubscription",
     "ResearchSuppression",
     "ResearchDigest",
     "ResearchEvent",
     "ResearchTopic",
+    "ResearchTopicFollow",
+    "ResearchTopicPreview",
     "ResearchTopicVerdict",
     "Base",
     "AutonomousSubmissionClaim",
@@ -282,6 +290,7 @@ __all__ = [
     "FrameworkDomain",
     "FrameworkCategory",
     "Framework",
+    "LegacyPwcSlug",
     "FrameworkPlatform",
     "TaskFramework",
     "AuthSession",
@@ -305,6 +314,7 @@ __all__ = [
     "Author",
     "AuthorAlias",
     "AuthorGoogleScholarProfile",
+    "AuthorPhoto",
     "PaperAuthor",
     "PaperTask",
     "PaperMethod",
@@ -325,8 +335,10 @@ __all__ = [
     "PaperAbstractMention",
     "PaperXThread",
     "PaperXPost",
+    "PaperXTrending",
     "XInsightPost",
     "PaperXThreadScan",
+    "XPostMetrics",
     "PaperRepository",
     "Area",
     "Task",
@@ -342,5 +354,7 @@ from backend.models.database.research import (
     ResearchDigest,
     ResearchEvent,
     ResearchTopic,
+    ResearchTopicFollow,
+    ResearchTopicPreview,
     ResearchTopicVerdict,
 )

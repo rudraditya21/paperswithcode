@@ -17,10 +17,21 @@
   box-shadow: 0 1px 2px rgba(30, 28, 20, 0.04), 0 12px 34px -18px rgba(30, 28, 20, 0.28);
   padding: 8px;
 }
-.ask-home-textarea-wrap { position: relative; }
+.ask-home-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+.ask-home-row > .chat-send,
+.ask-home-row > .chat-dictation-mic,
+.ask-home-row > .chat-dictation-pill { flex: none; margin: 0 2px 2px 0; }
+.ask-home-row > .chat-dictation-mic + .chat-send,
+.ask-home-row > .chat-dictation-pill + .chat-send { margin-left: -4px; }
+.ask-home-textarea-wrap { position: relative; flex: 1; min-width: 0; }
 .ask-home textarea {
   position: relative;
   z-index: 1;
+  display: block;
   width: 100%;
   border: 0;
   outline: 0;
@@ -31,21 +42,18 @@
   line-height: 1.45;
   color: transparent;
   caret-color: var(--ink);
-  padding: 12px 12px 4px;
+  padding: 8px 12px;
 }
 .ask-home textarea::placeholder { color: var(--ink-faint); }
-.ask-home-foot {
+/* Keep the MCP card at the bottom left even when the sidebar above it is short.
+   250px is the sidebar's top on first paint (header and feed title), so the card
+   stays above the fold before the sidebar sticks at 100px. */
+.feed-sidebar {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 4px 6px 4px 12px;
+  flex-direction: column;
+  min-height: calc(100dvh - 250px);
 }
-.ask-home-provider-tools {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
+.feed-sidebar > .sidebar-section-tools { margin-top: auto; margin-bottom: 0; }
 @media (max-width: 880px) {
   .layout-with-sidebar > .sidebar,
   .layout-with-sidebar > .feed-main {
@@ -54,9 +62,9 @@
   .feed-chat { order: 1; }
   .sidebar-section-top-domains { order: 2; }
   .sidebar-section-trending-domains { order: 3; }
-  .sidebar-section-follows { order: 2; }
   .feed-content { order: 4; }
   .sidebar-section-tools { order: 5; }
+  .feed-sidebar > .sidebar-section-tools { margin-top: 0; }
   /* /following without follows: lead with the feed intro, above the chat. */
   .feed-content:has(> .following-intro) { display: contents; }
   .feed-content:has(> .following-intro) > * { order: 4; }

@@ -15,12 +15,9 @@ from gradio_client import Client
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
-    Dataset,
     Evaluation,
-    Metric,
+    Paper,
     PaperTask,
-    Task,
-    TaskDatasetMetric,
 )
 from backend.services.artificial_analysis_sync_service import (
     ArtificialAnalysisDiscovery,
@@ -28,6 +25,14 @@ from backend.services.artificial_analysis_sync_service import (
     PaperIdentity,
 )
 from backend.services.evaluation_service import EvaluationService
+from backend.services.leaderboard_model_matching_service import (
+    LeaderboardModel,
+    LeaderboardModelMatcher,
+    MatchedModel,
+)
+from backend.services.leaderboard_sync_catalog import (
+    resolve_leaderboard,
+)
 from backend.services.leaderboard_sync_ownership import managed_methodology_prefix
 
 SPACE_APP_URL = "https://hf-audio-open-tts-leaderboard.hf.space"
@@ -67,6 +72,29 @@ _MODEL_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 _TAG_RE = re.compile(r"<[^>]+>")
+_REPORT_RE = re.compile(r"technical[\s_-]*report|tech[\s_-]*report", re.IGNORECASE)
+
+
+def has_paper(paper: Paper) -> bool:
+    """Whether a model's paper is an arXiv paper or a technical report.
+
+    Model cards, code repositories, and release blog posts are not papers, so
+    their models stay off the board.
+    """
+    if paper.source == "arxiv":
+        return True
+    source_url = (paper.source_url or "").split("?", 1)[0].split("#", 1)[0]
+    return source_url.casefold().endswith(".pdf") or bool(
+        _REPORT_RE.search(f"{paper.title or ''} {source_url}")
+    )
+
+
+def display_model_name(model_name: str) -> str:
+    """Drop the Hub organization: `org/Model-1B` is shown as `Model-1B`."""
+    head, sep, tail = model_name.partition(" ")
+    if head.count("/") == 1 and all(head.split("/")):
+        head = head.split("/", 1)[1]
+    return f"{head}{sep}{tail}"
 
 
 @dataclass(frozen=True)
@@ -141,7 +169,9 @@ class OpenTtsSyncStats:
     created: int = 0
     updated: int = 0
     deleted: int = 0
+    auto_matched: list[str] = field(default_factory=list)
     excluded_models: list[str] = field(default_factory=list)
+    no_paper_models: list[str] = field(default_factory=list)
     missing_papers: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -240,18 +270,14 @@ def parse_open_tts_leaderboard(
         )
 
     indexes = {name: headers.index(name) for name in required}
-    entries: list[OpenTtsEntry] = []
-    model_ids: set[str] = set()
+    entries_by_model: dict[str, OpenTtsEntry] = {}
     ranks: set[int] = set()
     for row in rows:
         if not isinstance(row, list) or len(row) != len(headers):
             raise ValueError("Open TTS response contains a malformed row")
-        aggregate_values = (
-            row[indexes["Rank"]],
-            row[indexes["Average WER ⬇️"]],
-            row[indexes["Average RTFx ⬆️"]],
-        )
-        if aggregate_values == (None, None, None):
+        # Upstream leaves Rank empty for models without full coverage of the
+        # selected languages/datasets; their averages are not comparable.
+        if row[indexes["Rank"]] is None:
             continue
         model_cell = str(row[indexes["Model"]])
         link = _MODEL_LINK_RE.fullmatch(model_cell.strip())
@@ -272,30 +298,32 @@ def parse_open_tts_leaderboard(
             or not 0 < rtfx < 1_000_000
         ):
             raise ValueError(f"Open TTS row is outside accepted bounds for {model_id}")
-        key = model_id.casefold()
-        if key in model_ids or rank in ranks:
-            raise ValueError("Open TTS response contains duplicate models or ranks")
-        model_ids.add(key)
+        if rank in ranks:
+            raise ValueError("Open TTS response contains duplicate ranks")
         ranks.add(rank)
         license_name = html.unescape(
             _TAG_RE.sub("", str(row[indexes["License"]]))
         ).strip()
-        entries.append(
-            OpenTtsEntry(
-                model_id=model_id,
-                model_name=model_name,
-                rank=rank,
-                wer=wer,
-                rtfx=rtfx,
-                is_open=license_name.casefold() not in {"proprietary", "closed"},
-            )
+        entry = OpenTtsEntry(
+            model_id=model_id,
+            model_name=model_name,
+            rank=rank,
+            wer=wer,
+            rtfx=rtfx,
+            is_open=license_name.casefold() not in {"proprietary", "closed"},
         )
-    if len(entries) < min_ranked_entries:
+        # Upstream can list one model twice under different voices; keep
+        # its best-ranked row.
+        key = model_id.casefold()
+        if key not in entries_by_model or rank < entries_by_model[key].rank:
+            entries_by_model[key] = entry
+    entries = list(entries_by_model.values())
+    if len(ranks) < min_ranked_entries:
         raise ValueError(
-            f"Open TTS returned {len(entries)} ranked rows; expected at least "
+            f"Open TTS returned {len(ranks)} ranked rows; expected at least "
             f"{min_ranked_entries}"
         )
-    if ranks != set(range(1, len(entries) + 1)):
+    if ranks != set(range(1, len(ranks) + 1)):
         raise ValueError("Open TTS ranks must be contiguous and start at one")
     return sorted(entries, key=lambda entry: entry.rank)
 
@@ -306,11 +334,11 @@ def fetch_open_tts_leaderboard(
     """Fetch English scores across Seed-TTS and CV3-Eval without cloning."""
     client = client_factory(SPACE_APP_URL, verbose=False)
     payload = client.predict(
-        "latest",
-        "",
-        [DEFAULT_LANGUAGE],
-        DEFAULT_DATASETS,
-        False,
+        version="latest",
+        search="",
+        langs=[DEFAULT_LANGUAGE],
+        datasets=DEFAULT_DATASETS,
+        clone=False,
         api_name="/partial",
     )
     return parse_open_tts_leaderboard(_default_table_value(payload))
@@ -322,21 +350,21 @@ def fetch_open_tts_leaderboards(
     """Fetch the English and all-available-language comparable views."""
     client = client_factory(SPACE_APP_URL, verbose=False)
     english_payload = client.predict(
-        "latest",
-        "",
-        [DEFAULT_LANGUAGE],
-        DEFAULT_DATASETS,
-        False,
+        version="latest",
+        search="",
+        langs=[DEFAULT_LANGUAGE],
+        datasets=DEFAULT_DATASETS,
+        clone=False,
         api_name="/partial",
     )
     languages = _available_languages(english_payload)
     english = parse_open_tts_leaderboard(_default_table_value(english_payload))
     all_language_payload = client.predict(
-        "latest",
-        "",
-        languages,
-        DEFAULT_DATASETS,
-        False,
+        version="latest",
+        search="",
+        langs=languages,
+        datasets=DEFAULT_DATASETS,
+        clone=False,
         api_name="/partial",
     )
     all_languages = parse_open_tts_leaderboard(
@@ -370,54 +398,19 @@ class OpenTtsSyncService:
     def __init__(self, db: Session):
         self.db = db
 
-    def _leaderboard_identity(self, dataset_slug: str) -> tuple[Task, Dataset]:
-        task = self.db.query(Task).filter(Task.slug == TASK_SLUG).one_or_none()
-        dataset = (
-            self.db.query(Dataset).filter(Dataset.slug == dataset_slug).one_or_none()
-        )
-        metrics = {
-            metric.name: metric
-            for metric in self.db.query(Metric)
-            .filter(Metric.name.in_((WER_METRIC, RTFX_METRIC)))
-            .all()
-        }
-        if (
-            task is None
-            or dataset is None
-            or set(metrics)
-            != {
-                WER_METRIC,
-                RTFX_METRIC,
-            }
-        ):
-            raise RuntimeError(
-                "Open TTS task, benchmark, or metrics are not configured"
-            )
-        configured = {
-            row.metric_id
-            for row in self.db.query(TaskDatasetMetric)
-            .filter(
-                TaskDatasetMetric.task_id == task.id,
-                TaskDatasetMetric.dataset_id == dataset.id,
-            )
-            .all()
-        }
-        if {metric.id for metric in metrics.values()} - configured:
-            raise RuntimeError(
-                "Open TTS leaderboard metrics are not linked to the task"
-            )
-        return task, dataset
-
     def _sync_dataset(
         self,
         entries: list[OpenTtsEntry],
         *,
         dataset_slug: str,
         discovery: ArtificialAnalysisDiscovery,
+        auto_matched: dict[str, MatchedModel],
         now: datetime,
     ) -> OpenTtsSyncStats:
         stats = OpenTtsSyncStats(fetched=len(entries))
-        task, dataset = self._leaderboard_identity(dataset_slug)
+        task, dataset = resolve_leaderboard(
+            self.db, "Open TTS", TASK_SLUG, dataset_slug, (WER_METRIC, RTFX_METRIC)
+        )
         candidate_rows = (
             self.db.query(Evaluation)
             .filter(
@@ -448,12 +441,20 @@ class OpenTtsSyncService:
         }
         for entry in entries:
             key = entry.model_id.casefold()
-            if key not in reviewed_ids:
+            if key in reviewed_ids:
+                paper_id = discovery.papers.get(entry.model_id)
+                if paper_id is None:
+                    stats.missing_papers.append(entry.model_id)
+                    continue
+            elif (match := auto_matched.get(entry.model_name)) is not None:
+                paper_id = match.paper_id
+                stats.auto_matched.append(entry.model_id)
+            else:
                 stats.excluded_models.append(entry.model_id)
                 continue
-            paper_id = discovery.papers.get(entry.model_id)
-            if paper_id is None:
-                stats.missing_papers.append(entry.model_id)
+            paper = self.db.get(Paper, paper_id)
+            if paper is None or not has_paper(paper):
+                stats.no_paper_models.append(entry.model_id)
                 continue
             selected_ids.add(key)
             row = managed_by_id.get(key)
@@ -468,7 +469,9 @@ class OpenTtsSyncService:
             else:
                 stats.updated += 1
             row.paper_id = paper_id
-            row.model_name = MODEL_DISPLAY_NAMES.get(entry.model_id, entry.model_name)
+            row.model_name = MODEL_DISPLAY_NAMES.get(
+                entry.model_id, display_model_name(entry.model_name)
+            )
             row.methodology = (
                 f"{MANAGED_METHODOLOGY_PREFIX} Upstream rank {entry.rank}; "
                 f"{METHODOLOGY_BY_DATASET[dataset_slug]} without voice cloning; "
@@ -519,15 +522,39 @@ class OpenTtsSyncService:
         if now.tzinfo is None:
             now = now.replace(tzinfo=UTC)
         try:
+            # Models outside the reviewed catalog go to the shared matcher
+            # once for both views; the rest become release-radar signals.
+            reviewed_ids = {model_id.casefold() for model_id in MODEL_PAPER_IDENTITIES}
+            unknown = list(
+                {
+                    entry.model_id.casefold(): LeaderboardModel(
+                        entry.model_name, entry.model_id.split("/", 1)[0]
+                    )
+                    for entries in leaderboards.values()
+                    for entry in entries
+                    if entry.model_id.casefold() not in reviewed_ids
+                }.values()
+            )
+            matcher = LeaderboardModelMatcher(
+                self.db,
+                provider="open-tts",
+                leaderboard_name="Open TTS",
+                leaderboard_url=SPACE_SOURCE_URL,
+            )
+            auto_matched = matcher.match(unknown)
             stats = {
                 dataset_slug: self._sync_dataset(
                     entries,
                     dataset_slug=dataset_slug,
                     discovery=discovery,
+                    auto_matched=auto_matched,
                     now=now,
                 )
                 for dataset_slug, entries in leaderboards.items()
             }
+            matcher.report_unmatched(
+                [model for model in unknown if model.name not in auto_matched]
+            )
             if commit:
                 self.db.commit()
             else:

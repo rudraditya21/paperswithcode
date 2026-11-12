@@ -1,0 +1,833 @@
+"""Parsing and sync tests for the frontier boards added with Gemini 4 Carbon."""
+
+import json
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
+
+import httpx
+import pytest
+from sqlalchemy import BigInteger, create_engine
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import Session
+
+from backend.models.database import (
+    Base,
+    Dataset,
+    Evaluation,
+    HfArtifact,
+    Metric,
+    ModelProviderAlias,
+    ModelRelease,
+    ModelReleaseArtifact,
+    ModelReleaseSignal,
+    Paper,
+    PaperHfArtifact,
+    PaperTask,
+    Task,
+    TaskDataset,
+    TaskDatasetMetric,
+)
+from backend.services import carbon_board_syncs as boards
+from backend.services.carbon_board_identities import IDENTITIES
+from backend.services.leaderboard_model_matching_service import (
+    family_lab,
+    link_owner,
+    vendor_label_model,
+)
+from backend.services.live_leaderboard_sync import (
+    LeaderboardEntry,
+    LiveLeaderboard,
+    LiveLeaderboardSyncService,
+    ModelIdentity,
+    js_literal,
+)
+
+
+@compiles(BigInteger, "sqlite")
+def _compile_bigint_sqlite(_element, _compiler, **_kw):
+    return "INTEGER"
+
+
+@compiles(ARRAY, "sqlite")
+@compiles(JSONB, "sqlite")
+@compiles(TSVECTOR, "sqlite")
+def _compile_postgres_types_sqlite(_element, _compiler, **_kw):
+    return "JSON"
+
+
+# Trimmed snapshots of each official leaderboard taken on 2026-10-29.
+FIXTURES = Path(__file__).parent / "fixtures" / "carbon_boards"
+
+
+def _fixture(name: str) -> str:
+    return (FIXTURES / name).read_text()
+
+
+def _by_name(entries: list[LeaderboardEntry]) -> dict[str, LeaderboardEntry]:
+    return {entry.name: entry for entry in entries}
+
+
+def test_js_literal_decodes_minified_and_hand_written_data():
+    source = "x=1,m={vb2:{'A b':{v:.5,w:-.25,list:[1,2,],}}, /* note */ n:'it\\'s'};"
+    assert js_literal(source, source.index("{"), "m") == {
+        "vb2": {"A b": {"v": 0.5, "w": -0.25, "list": [1, 2]}},
+        "n": "it's",
+    }
+    with pytest.raises(ValueError, match="not plain data"):
+        js_literal("m={a:f(1)}", 2, "m")
+    with pytest.raises(ValueError, match="unterminated"):
+        js_literal("m={a:[1}", 2, "m")
+
+
+def test_parse_vals_index_picks_the_ranked_table():
+    entries = boards.parse_vals_index(_fixture("vals_index.html"))
+    assert len(entries) == 29
+    carbon = _by_name(entries)["Gemini 4 Carbon"]
+    assert (carbon.value, carbon.harness) == (70.36, None)
+    assert carbon.detail == "70.36% Accuracy"
+
+
+def test_parse_swe_sweep_converts_fractions_to_percent():
+    entries = _by_name(boards.parse_swe_sweep(_fixture("swe_sweep.html")))
+    assert len(entries) == 13
+    assert entries["Opus 5.5 (xhigh)"].value == 3.61
+    assert entries["Opus 5.5 (xhigh)"].harness == "mini-SWE-agent"
+    assert entries["Opus 5.5 (xhigh)"].lab == "Anthropic"
+
+
+def test_parse_vending_bench_2_reads_every_model_from_the_chunk():
+    entries = _by_name(
+        boards.parse_vending_bench_2(_fixture("vending_bench_2_chunk.js"))
+    )
+    assert len(entries) == 73
+    carbon = entries["Gemini 4 Carbon"]
+    assert carbon.value == 16484.21
+    assert carbon.detail.startswith("$16,484.21 mean final balance over ")
+
+
+def test_fetch_vending_bench_2_follows_imports_to_the_data_chunk():
+    chunk = _fixture("vending_bench_2_chunk.js")
+    pages = {
+        boards.VENDING_BENCH_2_URL: '<link href="../_app/immutable/nodes/27.abc.js">'
+        '<link href="../_app/immutable/chunks/unrelated.js">',
+        "https://andonlabs.com/_app/immutable/nodes/27.abc.js": 'import{a}from"../chunks/data.js";',
+        "https://andonlabs.com/_app/immutable/chunks/data.js": chunk,
+    }
+
+    def handler(request):
+        return httpx.Response(200, text=pages[str(request.url)])
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert len(boards.fetch_vending_bench_2(client)) == 73
+
+
+def test_parse_vending_bench_2_reads_the_json_parse_chunk():
+    # Since 2026-11-02 the run data is a JSON.parse string with quoted keys,
+    # next to other runs (arena matches) that must be ignored.
+    chunk = _fixture("vending_bench_2_chunk_2026-11-06.js")
+    assert 'runs:JSON.parse(`{"vb2":{' in chunk
+    entries = _by_name(boards.parse_vending_bench_2(chunk))
+    assert len(entries) == 73
+    assert entries["Claude Fable 5 - High"].value == 5680.26
+    assert entries["Claude Fable 5 - High"].detail == (
+        "$5,680.26 mean final balance over 5 runs"
+    )
+
+
+def test_fetch_vending_bench_2_resolves_the_route_node_through_the_app_entry():
+    # The page preloads only layout nodes; node 26 is named by node_ids and
+    # the app entry's dynamic-import table.
+    pages = {
+        boards.VENDING_BENCH_2_URL: (
+            '<link href="../_app/immutable/entry/app.xyz.js">'
+            '<link href="../_app/immutable/nodes/0.abc.js">'
+            "<script>kit.start(app, element, {node_ids: [0, 3, 26], data: []});"
+            "</script>"
+        ),
+        "https://andonlabs.com/_app/immutable/entry/app.xyz.js": (
+            '["../nodes/2.aaa.js","../nodes/26.CKje-A28.js"],'
+            "()=>import(`../nodes/26.CKje-A28.js`),()=>import(`../nodes/3.q.js`)"
+        ),
+        "https://andonlabs.com/_app/immutable/nodes/0.abc.js": "export{};",
+        "https://andonlabs.com/_app/immutable/nodes/3.q.js": "export{};",
+        "https://andonlabs.com/_app/immutable/nodes/26.CKje-A28.js": (
+            'import{t as z}from"../chunks/3yXS6ZzI.js";let e=z.runs.vb2;'
+        ),
+        "https://andonlabs.com/_app/immutable/chunks/3yXS6ZzI.js": _fixture(
+            "vending_bench_2_chunk_2026-11-06.js"
+        ),
+    }
+
+    def handler(request):
+        return httpx.Response(200, text=pages[str(request.url)])
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert len(boards.fetch_vending_bench_2(client)) == 73
+
+
+def test_parse_blueprint_bench_2_skips_human_and_floor_rows():
+    entries = _by_name(
+        boards.parse_blueprint_bench_2(_fixture("blueprint_bench_2.html"))
+    )
+    assert entries["Gemini 4 Carbon"].value == 0.586
+    assert not any(name.endswith("*") for name in entries)
+    assert all(entry.value > 0 for entry in entries.values())
+
+
+def test_parse_riemann_bench_reads_visible_percentages():
+    # v1.1 (2026-11-02): answer keys changed for four problems and only the
+    # 21 current models were re-run.
+    entries = _by_name(boards.parse_riemann_bench(_fixture("riemann_bench.html")))
+    assert len(entries) == 21
+    assert entries["GPT 5.6 Sol"].value == pytest.approx(83.2)
+    # "Hy" + "Hy4 Preview" names the model once.
+    assert "Hy4 Preview" in entries
+    board = boards.BOARD_SYNCS["sync_riemann_bench"].board
+    assert "v1.1 answer keys" in board.protocol
+    reviewed = [name for name in entries if name in board.identities]
+    assert len(reviewed) == 21 >= board.min_selected
+
+
+def test_parse_cwe_bench_reads_the_v2_json_ld_item_list():
+    entries = _by_name(boards.parse_cwe_bench(_fixture("cwe_bench.html")))
+    assert len(entries) == 11
+    opus = entries["Claude Opus 5.5"]
+    assert (opus.value, opus.harness) == (67.1, "Claude Code")
+    assert opus.detail == "pass@1 67.1% over all 250 tasks (pass@4 79.2%)"
+    board = boards.BOARD_SYNCS["sync_cwe_bench"].board
+    # v2 has its own board; the v1 board stays a frozen snapshot.
+    assert board.dataset_slug == "cwe-bench-v2"
+    assert set(entries) == set(board.identities)
+
+
+def test_parse_exploitgym_keeps_only_six_hour_full_set_runs():
+    entries = _by_name(boards.parse_exploitgym(_fixture("exploitgym.json")))
+    assert entries["GPT-5.6 Sol"].value == 33.7
+    assert entries["GPT-5.6 Sol"].harness == "Codex CLI"
+    assert entries["Claude Opus 5.5"].harness == "Not reported"
+    # 2h runs, token-budgeted runs, and selected subsets are other protocols.
+    assert "GPT-5.4" not in entries
+    assert "GPT-6 Astra" not in entries
+    assert all("subset" not in entry.detail for entry in entries.values())
+
+
+def test_parse_cybergym_keeps_the_default_model_focused_level_1_view():
+    entries = boards.parse_cybergym(
+        _fixture("cybergym.json"), now=datetime(2026, 10, 29, tzinfo=UTC)
+    )
+    by_label = {entry.label: entry for entry in entries}
+    assert by_label["DeepSeek-V4-Pro (DeepSeek Agent)"].value == 83.3
+    # One model can appear under several agents; each is its own row.
+    assert by_label["GPT-5.4 (OpenAI Agent)"].value == 79.0
+    assert by_label["GPT-5.4 (Codex CLI)"].value == 66.3
+    names = {entry.name for entry in entries}
+    # Agent-focused systems, 30-trial runs, and dynamic / test-time-memory
+    # runs are other views of the board.
+    assert "Multi-model (DeepSeek-V4.1-Flash, Abliterated GLM-5.2)" not in names
+    assert all("dynamic" not in entry.detail for entry in entries)
+    assert len(entries) == 44
+
+
+def test_parse_critpt_reads_the_original_no_harness_scores():
+    entries = _by_name(boards.parse_critpt(_fixture("aa_critpt.html")))
+    assert len(entries) == 27
+    assert entries["GPT-6 Astra (max)"].value == 31.71
+    assert entries["GPT-6 Astra (max)"].lab == "OpenAI"
+    assert entries["GPT-6 Astra (max)"].harness is None
+    # Models charted only on the v2 page have no original-dataset score.
+    assert "Gemini 4 Carbon (high)" not in entries
+
+
+def test_parse_critpt_v2_reads_the_agentic_score_not_the_hard_one():
+    entries = _by_name(boards.parse_critpt_v2(_fixture("aa_critpt_v2.html")))
+    assert len(entries) == 28
+    assert entries["GPT-6 Astra (max)"].value == 83.14
+    assert entries["Gemini 4 Carbon (high)"].value == 82.29
+    assert "gemini-4-carbon" in entries["Gemini 4 Carbon (high)"].detail
+
+
+def test_parse_critpt_fails_when_the_page_layout_changes():
+    source = _fixture("aa_critpt.html")
+    with pytest.raises(ValueError, match="no Next.js data chunks"):
+        boards.parse_critpt(source.replace("self.__next_f.push", "self.__x.push"))
+    with pytest.raises(ValueError, match="has 0 entries"):
+        boards.parse_critpt(source.replace('\\"critpt\\"', '\\"critPt\\"'))
+
+
+def test_parse_terminal_bench_science_tags_aa_runs_with_mini_swe_agent():
+    entries = _by_name(
+        boards.parse_terminal_bench_science(_fixture("aa_terminal_bench_science.html"))
+    )
+    assert len(entries) == 28
+    assert entries["Gemini 4 Carbon (high)"].value == 64.76
+    assert entries["Gemini 4 Carbon (high)"].harness == "mini-SWE-agent"
+    # A zero is a real result, not a missing score.
+    assert entries["Inkling (xhigh)"].value == 0
+    board = boards.BOARD_SYNCS["sync_terminal_bench_science"].board
+    assert not board.adopt_unmanaged
+
+
+def test_critpt_keeps_self_reported_rows_and_reviews_aa_names():
+    board = boards.BOARD_SYNCS["sync_critpt"].board
+    for name in ("K2 Horizon 375B A23B", "Nemotron 3.5 Super VL", "Beam 1.0"):
+        assert board.excluded[name]
+        assert name not in board.identities
+    # Hand-imported Artificial Analysis rows keep their model names.
+    assert board.identities["Inkling (xhigh)"].model_name == "Inkling"
+    assert board.identities["GPT-5.6 Sol (max)"].model_name == "GPT-5.6 Sol (max)"
+    v2 = boards.BOARD_SYNCS["sync_critpt_v2"].board
+    assert v2.dataset_slug == "critpt-v2" and not v2.excluded
+    assert "Beam 1.0" in v2.identities
+
+
+def test_parse_cybergym_waits_for_held_back_rows():
+    data = json.loads(_fixture("cybergym.json"))
+    row = next(r for r in data["level1"] if r["model"] == "GLM-5.1")
+    row["visible_after"] = "2026-11-01T00:00:00-07:00"
+    entries = boards.parse_cybergym(
+        json.dumps(data), now=datetime(2026, 10, 29, tzinfo=UTC)
+    )
+    assert "GLM-5.1" not in {entry.name for entry in entries}
+
+
+def test_parse_patcheval_verified_reads_the_readme_results_table():
+    entries = _by_name(
+        boards.parse_patcheval_verified(_fixture("patcheval_verified.md"))
+    )
+    assert entries["gpt-5.6-sol"].value == 83.91
+    assert entries["gpt-5.6-sol"].harness == "Codex"
+    assert entries["seed-2.1-turbo"].harness == "Trae CLI"
+    assert entries["GLM 5.2"].harness == "OpenCode"
+    assert "193/230 CVEs repaired" in entries["gpt-5.6-sol"].detail
+    assert set(entries) == set(IDENTITIES["patcheval-verified"])
+
+
+@pytest.mark.parametrize(
+    ("parse", "fixture", "old", "new", "message"),
+    [
+        (
+            boards.parse_vals_index,
+            "vals_index.html",
+            "Accuracy",
+            "Score",
+            "0 ranked tables",
+        ),
+        (
+            boards.parse_blueprint_bench_2,
+            "blueprint_bench_2.html",
+            ">Score<",
+            ">Points<",
+            "header changed",
+        ),
+        (
+            boards.parse_cwe_bench,
+            "cwe_bench.html",
+            "pass@1 67.1%, pass@4 79.2% over 250 tasks",
+            "pass@1 67.1%, pass@4 79.2% over 100 tasks",
+            "description changed",
+        ),
+        (
+            boards.parse_riemann_bench,
+            "riemann_bench.html",
+            "Riemann-bench Leaderboard",
+            "Leaderboard",
+            "0 leaderboard blocks",
+        ),
+        (
+            boards.parse_exploitgym,
+            "exploitgym.json",
+            '"total": 869',
+            '"total": 9',
+            "instance total changed",
+        ),
+        (
+            boards.parse_cybergym,
+            "cybergym.json",
+            '"level1"',
+            '"levelOne"',
+            "no level1 list",
+        ),
+        (
+            boards.parse_patcheval_verified,
+            "patcheval_verified.md",
+            "| Agent | Model | Pass@1 |",
+            "| Agent | Model | Resolved |",
+            "header changed",
+        ),
+        (
+            boards.parse_critpt_v2,
+            "aa_critpt_v2.html",
+            '\\"critptAgentic\\":0.831428571428571',
+            '\\"critptAgentic\\":83.1428571428571',
+            "outside 0-1",
+        ),
+        (
+            boards.parse_patcheval_verified,
+            "patcheval_verified.md",
+            "193/230",
+            "193/300",
+            "case count changed",
+        ),
+    ],
+)
+def test_parsers_fail_on_layout_changes(parse, fixture, old, new, message):
+    source = _fixture(fixture)
+    assert old in source
+    with pytest.raises(ValueError, match=message):
+        parse(source.replace(old, new, 1))
+
+
+def test_every_board_has_identities_and_a_configured_fetcher():
+    assert set(boards.BOARD_SYNCS) == {
+        "sync_vals_index",
+        "sync_swe_sweep",
+        "sync_vending_bench_2",
+        "sync_blueprint_bench_2",
+        "sync_riemann_bench",
+        "sync_cwe_bench",
+        "sync_exploitgym",
+        "sync_cybergym",
+        "sync_patcheval_verified",
+        "sync_critpt",
+        "sync_critpt_v2",
+        "sync_terminal_bench_science",
+        "sync_vals_finance_agent",
+        "sync_surge_chartography",
+        "sync_swe_marathon",
+        "sync_jevbench",
+    }
+    for job, sync in boards.BOARD_SYNCS.items():
+        assert len(sync.board.identities) >= sync.board.min_selected
+        if job not in (
+            "sync_vals_finance_agent",
+            "sync_surge_chartography",
+            "sync_swe_marathon",
+            "sync_jevbench",
+        ):
+            assert sync.board.identities is IDENTITIES[sync.board.dataset_slug]
+
+
+# --- Engine -------------------------------------------------------------------
+
+TASK_ID = 15
+DATASET_ID = 9000
+METRIC = "Resolved"
+OPUS = "https://www.anthropic.com/claude-opus-5-5"
+SOL = "https://openai.com/index/gpt-5-6"
+
+
+def _board(**overrides) -> LiveLeaderboard:
+    fields = dict(
+        source="Test Board",
+        provider="test-board",
+        url="https://example.com/board",
+        task_slug="coding-agents",
+        dataset_slug="test-board",
+        metric=METRIC,
+        identities={
+            "Opus 5.5 (xhigh)": ModelIdentity("Claude Opus 5.5", source_url=OPUS),
+            "Sol 5.6 (high)": ModelIdentity("GPT-5.6 Sol", source_url=SOL),
+            "Sol 5.6 (xhigh)": ModelIdentity("GPT-5.6 Sol", source_url=SOL),
+        },
+        min_selected=2,
+        protocol="Test protocol.",
+    )
+    return LiveLeaderboard(**{**fields, **overrides})
+
+
+def _session() -> Session:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            Paper.__table__,
+            Task.__table__,
+            Dataset.__table__,
+            Metric.__table__,
+            TaskDataset.__table__,
+            TaskDatasetMetric.__table__,
+            Evaluation.__table__,
+            PaperTask.__table__,
+            HfArtifact.__table__,
+            PaperHfArtifact.__table__,
+            ModelRelease.__table__,
+            ModelReleaseArtifact.__table__,
+            ModelProviderAlias.__table__,
+            ModelReleaseSignal.__table__,
+        ],
+    )
+    session = Session(engine)
+    session.add(Task(id=TASK_ID, name="Coding Agents", slug="coding-agents"))
+    session.add(Dataset(id=DATASET_ID, name="Test Board", slug="test-board"))
+    session.add(Metric(id=1, name=METRIC, direction="higher_is_better"))
+    session.add(
+        TaskDataset(task_id=TASK_ID, dataset_id=DATASET_ID, supports_harness=True)
+    )
+    session.add(TaskDatasetMetric(task_id=TASK_ID, dataset_id=DATASET_ID, metric_id=1))
+    for paper_id, url in ((1, OPUS), (2, SOL)):
+        session.add(
+            Paper(
+                id=paper_id,
+                title=url,
+                source="external",
+                source_url=url,
+                version="v1",
+                is_latest_version=True,
+            )
+        )
+    session.commit()
+    return session
+
+
+def _entry(name: str, value: float, harness: str | None = "mini-SWE-agent"):
+    return LeaderboardEntry(name, value, f"{value}% resolved", harness=harness)
+
+
+def _rows(session: Session) -> dict[str, Evaluation]:
+    return {
+        f"{row.model_name} ({row.harness})": row
+        for row in session.query(Evaluation).filter(Evaluation.dataset_id == DATASET_ID)
+    }
+
+
+def test_sync_creates_rows_keeping_each_models_best_setting():
+    session = _session()
+    stats = LiveLeaderboardSyncService(session, _board()).sync(
+        [
+            _entry("Opus 5.5 (xhigh)", 3.61),
+            _entry("Sol 5.6 (high)", 3.1),
+            _entry("Sol 5.6 (xhigh)", 4.7),
+        ]
+    )
+    rows = _rows(session)
+    assert set(rows) == {
+        "Claude Opus 5.5 (mini-SWE-agent)",
+        "GPT-5.6 Sol (mini-SWE-agent)",
+    }
+    sol = rows["GPT-5.6 Sol (mini-SWE-agent)"]
+    assert sol.metrics == {METRIC: 4.7}
+    assert sol.methodology.startswith(
+        "Managed by the Papers with Code Test Board live sync. "
+        'Official leaderboard entry "Sol 5.6 (xhigh) (mini-SWE-agent)"'
+    )
+    assert sol.best_rank == 1 and sol.external is True
+    assert sol.evaluated_on == datetime.now(UTC).date()
+    assert (stats.created, stats.matched) == (2, 2)
+
+
+def test_sync_adopts_a_hand_imported_row_and_its_unreported_harness():
+    session = _session()
+    hand = Evaluation(
+        paper_id=1,
+        task_id=TASK_ID,
+        dataset_id=DATASET_ID,
+        model_name="Claude Opus 5.5",
+        harness="Not reported",
+        metrics={METRIC: 3.6},
+        best_metric=METRIC,
+        methodology="Hand import from the system card.",
+        is_open=False,
+    )
+    session.add(hand)
+    session.commit()
+    stats = LiveLeaderboardSyncService(session, _board()).sync(
+        [_entry("Opus 5.5 (xhigh)", 3.61), _entry("Sol 5.6 (xhigh)", 4.7)]
+    )
+    assert stats.adopted == 1 and stats.created == 1
+    assert (
+        session.query(Evaluation).filter_by(model_name="Claude Opus 5.5").count() == 1
+    )
+    assert (hand.harness, hand.metrics) == ("mini-SWE-agent", {METRIC: 3.61})
+    assert hand.source_url == "https://example.com/board"
+    # The hand-written methodology stays as reviewer notes beneath the head.
+    assert hand.methodology.endswith(
+        "listed at https://example.com/board. Test protocol. "
+        "Hand import from the system card."
+    )
+
+    # A second run only reports unchanged managed rows.
+    again = LiveLeaderboardSyncService(session, _board()).sync(
+        [_entry("Opus 5.5 (xhigh)", 3.61), _entry("Sol 5.6 (xhigh)", 4.7)]
+    )
+    assert (again.created, again.changed, again.adopted) == (0, 0, 0)
+
+
+def test_sync_without_adoption_keeps_a_vendor_row_beside_the_rerun():
+    session = _session()
+    vendor = Evaluation(
+        paper_id=1,
+        task_id=TASK_ID,
+        dataset_id=DATASET_ID,
+        model_name="Claude Opus 5.5",
+        harness="Claude Code",
+        metrics={METRIC: 5.9},
+        best_metric=METRIC,
+        methodology="Hand import from the system card.",
+        is_open=False,
+    )
+    session.add(vendor)
+    session.commit()
+    stats = LiveLeaderboardSyncService(session, _board(adopt_unmanaged=False)).sync(
+        [_entry("Opus 5.5 (xhigh)", 3.61), _entry("Sol 5.6 (xhigh)", 4.7)]
+    )
+    assert (stats.adopted, stats.created) == (0, 2)
+    assert (vendor.harness, vendor.metrics) == ("Claude Code", {METRIC: 5.9})
+    assert (
+        session.query(Evaluation).filter_by(model_name="Claude Opus 5.5").count() == 2
+    )
+
+
+def test_sync_skips_excluded_names_and_reports_rows_that_leave_upstream():
+    session = _session()
+    service = LiveLeaderboardSyncService(session, _board())
+    service.sync([_entry("Opus 5.5 (xhigh)", 3.61), _entry("Sol 5.6 (xhigh)", 4.7)])
+
+    board = _board(excluded={"Sol 5.6 (xhigh)": "partial run"})
+    stats = LiveLeaderboardSyncService(session, board).sync(
+        [
+            _entry("Opus 5.5 (xhigh)", 3.7),
+            _entry("Sol 5.6 (high)", 3.1),
+            _entry("Sol 5.6 (xhigh)", 9.9),
+        ]
+    )
+    assert stats.excluded == 1
+    assert _rows(session)["GPT-5.6 Sol (mini-SWE-agent)"].metrics == {METRIC: 3.1}
+    assert stats.missing_upstream == []
+
+    gone = LiveLeaderboardSyncService(session, _board()).sync(
+        [_entry("Opus 5.5 (xhigh)", 3.7), _entry("Sol 5.6 (high)", 3.1)]
+    )
+    assert gone.missing_upstream == []
+    rows = _rows(session)
+    assert len(rows) == 2  # never deleted
+
+
+def test_sync_reports_unknown_models_to_the_release_radar():
+    session = _session()
+    stats = LiveLeaderboardSyncService(session, _board()).sync(
+        [
+            _entry("Opus 5.5 (xhigh)", 3.61),
+            _entry("Sol 5.6 (xhigh)", 4.7),
+            LeaderboardEntry(
+                "Mystery 9", 1.0, "1.0% resolved", "mini-SWE-agent", "Lab X"
+            ),
+        ]
+    )
+    assert stats.unreviewed == ["Mystery 9 (mini-SWE-agent)"]
+    assert session.query(ModelReleaseSignal).count() == 1
+
+
+def test_bare_model_names_reach_the_radar_with_their_family_lab():
+    session = _session()
+    LiveLeaderboardSyncService(session, _board()).sync(
+        [
+            _entry("Opus 5.5 (xhigh)", 3.61),
+            _entry("Sol 5.6 (xhigh)", 4.7),
+            LeaderboardEntry("Claude Mythos 6", 2.0, "2.0% resolved", "mini-SWE-agent"),
+            LeaderboardEntry("Mystery 9", 1.0, "1.0% resolved", "mini-SWE-agent"),
+        ]
+    )
+    signals = session.query(ModelReleaseSignal).all()
+    assert [(s.lab, s.model_name) for s in signals] == [
+        ("Anthropic", "Claude Mythos 6")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "lab"),
+    [
+        ("GPT-6.2 Terra", "OpenAI"),
+        ("o5-mini", "OpenAI"),
+        ("Gemini 4.1 Pro", "Google DeepMind"),
+        ("Qwen3.9-Max", "Alibaba"),
+        ("Kimi K4", "Moonshot AI"),
+        ("Nova 2", ""),
+        ("Opus 5.5", "Anthropic"),
+        ("Sol 5.6", ""),
+    ],
+)
+def test_family_lab(name, lab):
+    assert family_lab(name) == lab
+
+
+def test_sync_refuses_a_collapsed_board_without_writing():
+    session = _session()
+    with pytest.raises(RuntimeError, match="only 1 reviewed models"):
+        LiveLeaderboardSyncService(session, _board()).sync(
+            [_entry("Opus 5.5 (xhigh)", 3.61)]
+        )
+    assert session.query(Evaluation).count() == 0
+
+
+def test_sync_dry_run_rolls_back():
+    session = _session()
+    LiveLeaderboardSyncService(session, _board()).sync(
+        [_entry("Opus 5.5 (xhigh)", 3.61), _entry("Sol 5.6 (xhigh)", 4.7)], commit=False
+    )
+    assert session.query(Evaluation).count() == 0
+
+
+def test_parse_vals_index_ignores_empty_tables():
+    html = _fixture("vals_index.html").replace("<body>", "<body><table></table>", 1)
+    assert len(boards.parse_vals_index(html)) == 29
+
+
+def test_riemann_fetch_sends_the_surge_browser_user_agent():
+    seen = {}
+
+    def handler(request):
+        seen["agent"] = request.headers["User-Agent"]
+        return httpx.Response(200, text=_fixture("riemann_bench.html"))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert len(boards.BOARD_SYNCS["sync_riemann_bench"].fetch(client)) == 21
+    assert seen["agent"].startswith("Mozilla/5.0 (X11; Linux x86_64)")
+
+
+@pytest.mark.parametrize(
+    ("name", "model_name"),
+    [
+        ("Feyospace-v1.1 (finetuned from Qwen3.8-27B)", "Feyospace-v1.1"),
+        ("GPT-5.5-Cyber", "GPT-5.5-Cyber"),
+        ("Claude Mythos Preview", "Claude Mythos Preview"),
+        ("GLM-4.7", "GLM-4.7"),
+        ("GPT-4.1", "GPT-4.1"),
+    ],
+)
+def test_cybergym_reviews_released_models(name, model_name):
+    board = boards.BOARD_SYNCS["sync_cybergym"].board
+    assert board.identities[name].model_name == model_name
+    assert name not in board.excluded
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "XekRung-1.5-27B-Preview (finetuned from Qwen3.8-27B)",
+        "Basin (basin1-0912-pre-dpo)",
+        "DeepSeek-V4-Pro Preview",
+        "OpenHands-LM-32B",
+    ],
+)
+def test_cybergym_excludes_preview_and_training_checkpoints(name):
+    board = boards.BOARD_SYNCS["sync_cybergym"].board
+    assert board.excluded[name]
+    assert name not in board.identities
+
+
+def test_vals_index_maps_the_open_mistral_large_4_release():
+    identity = IDENTITIES["vals-index-v2-2"]["Mistral Large 4 OSS"]
+    assert identity.is_open
+    # The paper's source moved to the technical report on 2026-11-02.
+    assert identity.source_url == (
+        "https://huggingface.co/mistralai/Mistral-Large-4-1T-A52B/blob/main/"
+        "assets/technical_report.pdf"
+    )
+    assert IDENTITIES["vals-index-v2-2"]["Mercury 3"].source_url == (
+        "https://www.inceptionlabs.ai/blog/introducing-mercury-3"
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "lab", "expected"),
+    [
+        ("OpenAI GPT-6.1 Sol (Reasoning Low)", "", ("GPT-6.1 Sol", "OpenAI")),
+        (
+            "Google Gemini 3.7 Flash (Thinking High)",
+            "",
+            ("Gemini 3.7 Flash", "Google DeepMind"),
+        ),
+        ("Qwen3.8 27B", "", ("Qwen3.8 27B", "Alibaba")),
+        ("NovaOCR-3", "nova-lab", ("NovaOCR-3", "nova-lab")),
+        ("Google Veo-Doc 2", "", ("Veo-Doc 2", "Google")),
+    ],
+)
+def test_vendor_label_model(label, lab, expected):
+    model = vendor_label_model(label, lab)
+    assert (model.name, model.lab) == expected
+
+
+def test_sync_keeps_reviewer_notes_and_other_metrics_of_managed_rows():
+    session = _session()
+    service = LiveLeaderboardSyncService(session, _board())
+    entries = [_entry("Opus 5.5 (xhigh)", 3.61), _entry("Sol 5.6 (xhigh)", 4.7)]
+    service.sync(entries)
+    opus = _rows(session)["Claude Opus 5.5 (mini-SWE-agent)"]
+    opus.methodology += " Reviewed against the paper."
+    opus.metrics = {**opus.metrics, "Cost ($)": 12.0}
+    session.commit()
+
+    unchanged = service.sync(entries)
+    assert unchanged.changed == 0
+    revised = service.sync([_entry("Opus 5.5 (xhigh)", 3.9), entries[1]])
+    assert revised.changed == 1
+    assert opus.metrics == {METRIC: 3.9, "Cost ($)": 12.0}
+    assert opus.methodology.endswith(
+        "3.9% resolved, listed at https://example.com/board. Test protocol. "
+        "Reviewed against the paper."
+    )
+
+
+def test_sync_appends_the_board_model_name_suffix():
+    session = _session()
+    LiveLeaderboardSyncService(session, _board(model_name_suffix=" (no tools)")).sync(
+        [_entry("Opus 5.5 (xhigh)", 3.61), _entry("Sol 5.6 (xhigh)", 4.7)]
+    )
+    assert set(_rows(session)) == {
+        "Claude Opus 5.5 (no tools) (mini-SWE-agent)",
+        "GPT-5.6 Sol (no tools) (mini-SWE-agent)",
+    }
+
+
+@pytest.mark.parametrize(
+    ("url", "owner"),
+    [
+        ("https://huggingface.co/nvidia/Kumo", "nvidia"),
+        ("https://huggingface.co/blog/nvidia/kumo-tabular", "nvidia"),
+        ("https://huggingface.co/spaces/nvidia/kumo-demo", "nvidia"),
+        ("https://huggingface.co/datasets/nvidia/kumo-data", "nvidia"),
+        ("https://huggingface.co/papers/2611.01234", ""),
+        ("https://github.com/layer6ai-labs/TabDPT-inference/releases", "layer6ai-labs"),
+        ("https://scikit-learn.org/stable/modules/neighbors.html", None),
+    ],
+)
+def test_link_owner(url, owner):
+    assert link_owner(url) == owner
+
+
+def test_sync_keeps_an_unrounded_score_at_the_published_precision():
+    session = _session()
+    service = LiveLeaderboardSyncService(session, _board())
+    sol = [_entry("Sol 5.6 (xhigh)", 4.7)]
+    service.sync([_entry("Opus 5.5 (xhigh)", 3.61), *sol])
+    opus = _rows(session)["Claude Opus 5.5 (mini-SWE-agent)"]
+    opus.metrics = {METRIC: 3.614}
+    session.commit()
+
+    # 3.614 is 3.61 at the board's two decimals: kept, not a revision.
+    listed = LeaderboardEntry(
+        "Opus 5.5 (xhigh)", Decimal("3.61"), "3.61% resolved", "mini-SWE-agent"
+    )
+    assert service.sync([listed, *sol]).changed == 0
+    assert opus.metrics == {METRIC: 3.614}
+    # A trailing zero is still precision: 3.614 is not 3.60.
+    revised = LeaderboardEntry(
+        "Opus 5.5 (xhigh)", Decimal("3.60"), "3.60% resolved", "mini-SWE-agent"
+    )
+    assert service.sync([revised, *sol]).changed == 1
+    assert opus.metrics == {METRIC: 3.6}
+
+
+def test_collapse_floor_counts_distinct_models_not_labels():
+    session = _session()
+    # Two labels name GPT-5.6 Sol, so three labels are only two models.
+    board = _board(min_selected=3)
+    entries = [
+        _entry("Opus 5.5 (xhigh)", 3.61),
+        _entry("Sol 5.6 (high)", 3.1),
+        _entry("Sol 5.6 (xhigh)", 4.7),
+    ]
+    with pytest.raises(RuntimeError, match="only 2 reviewed models"):
+        LiveLeaderboardSyncService(session, board).sync(entries)

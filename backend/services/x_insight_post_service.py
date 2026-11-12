@@ -1,6 +1,6 @@
 """Insight posts for the Papers with Code X account.
 
-Besides the four-hourly trending paper, the account posts twice a day about
+Besides the eight-hourly trending paper, the account posts twice a day about
 what is moving on the site:
 
 * ``top_papers_week`` / ``top_papers_month``: the top trending papers of the
@@ -34,18 +34,24 @@ from backend.models.database import (
     Evaluation,
     Metric,
     Paper,
-    PaperXThread,
     Task,
     XInsightPost,
 )
 from backend.services.benchmark_trend_service import _support_weighted_score
-from backend.services.metric_value_service import parse_metric_value
 from backend.services.method_service import MethodService
 from backend.services.task_service import TaskService
 from backend.services.x_insight_cards import Bar, render_bar_card, render_list_card
-from backend.services.x_thread_discovery_service import short_name
 from backend.services.x_trending_post_service import (
+    Row,
     XPoster,
+    fmt,
+    hf_org_x_handle,
+    leaderboard_rows,
+    luna_text,
+    numbers,
+    organization_x_handle,
+    paper_label,
+    paper_threads,
     paragraphs,
     weighted_length,
 )
@@ -64,15 +70,8 @@ SOTA_MIN_ENTRIES = 5
 BENCHMARK_RECENT_DAYS = 90
 BENCHMARK_BASELINE_DAYS = 180
 BENCHMARK_MIN_RECENT_PAPERS = 5
-LUNA_MODEL = "gpt-5.6-luna"
-RESPONSES_URL = "https://api.openai.com/v1/responses"
-_NUMBER = re.compile(r"\d+(?:\.\d+)?")
 _MENTION = re.compile(r"@[A-Za-z0-9_]{1,15}")
 _X_HANDLE = re.compile(r"[A-Za-z0-9_]{1,15}")
-_HF_X_LINK = re.compile(
-    r'href="https://(?:www\.)?(?:twitter|x)\.com/([A-Za-z0-9_]{1,15})/?"'
-)
-_IGNORED_HANDLES = {"huggingface", "home", "intent", "share", "x", "twitter"}
 
 LUNA_INSTRUCTIONS = """You write posts for the Papers with Code account on X, \
 read by ML researchers and engineers.
@@ -99,25 +98,8 @@ class Insight:
     facts: dict[str, Any] = field(default_factory=dict)
 
 
-def fmt(value: float) -> str:
-    """Compact metric value: at most two decimals, no trailing zeros."""
-    text = f"{value:.1f}" if abs(value) >= 100 else f"{value:.2f}"
-    return text.rstrip("0").rstrip(".") if "." in text else text
-
-
 def fmt_lift(value: float) -> str:
     return f"{value:.1f}x" if value < 10 else f"{value:.0f}x"
-
-
-def paper_label(title: str, *, limit: int = 48) -> str:
-    """The name before the colon ("MiMo-V2.6"), else the title, shortened."""
-    title = " ".join(title.split())
-    name = short_name(title) or title.split(":", 1)[0].strip()
-    if ":" in title and len(name) <= 30:
-        return name
-    if len(title) <= limit:
-        return title
-    return title[: title.rfind(" ", 0, limit)].rstrip(" ,;:-") + "…"
 
 
 def recently_posted(
@@ -212,39 +194,6 @@ def compose_list(head: str, labels: list[str], max_chars: int = 280) -> str:
 # --- New SOTA -------------------------------------------------------------
 
 
-@dataclass
-class Row:
-    evaluation_id: int
-    paper_id: int
-    model: str
-    value: float
-
-
-def _leaderboard(db: Session, dataset_id: int, metric: str) -> list[Row]:
-    """Every result for this benchmark and metric, across all tasks.
-
-    A benchmark can have a leaderboard under several tasks (IFEval under both
-    Instruction Following and Language Modeling); a new SOTA has to beat them
-    all, or the site itself would contradict the post.
-    """
-    rows = db.execute(
-        select(
-            Evaluation.id,
-            Evaluation.paper_id,
-            Evaluation.model_name,
-            Evaluation.metrics[metric].astext,
-        ).where(
-            Evaluation.dataset_id == dataset_id,
-            Evaluation.metrics.has_key(metric),
-        )
-    ).all()
-    parsed = [
-        Row(row[0], row[1], row[2] or "Unnamed model", parse_metric_value(row[3]))
-        for row in rows
-    ]
-    return [row for row in parsed if row.value is not None]
-
-
 def _distinct_models(rows: list[Row], limit: int) -> list[Row]:
     seen: set[str] = set()
     result = []
@@ -288,7 +237,7 @@ def new_sota(
         subject = f"{dataset.id}:{metric}:{paper.id}"
         if sota_posted(db, subject):
             continue
-        rows = _leaderboard(db, dataset.id, metric)
+        rows = leaderboard_rows(db, dataset.id, metric)
         if len(rows) < SOTA_MIN_ENTRIES or (best and len(rows) <= best[0]):
             continue
         direction = db.scalar(select(Metric.direction).where(Metric.name == metric))
@@ -343,22 +292,6 @@ def new_sota(
     return insight
 
 
-def hf_org_x_handle(hf_slug: str) -> str | None:
-    """The X account an organization links from its Hugging Face page."""
-    try:
-        response = httpx.get(f"https://huggingface.co/{hf_slug}", timeout=15)
-    except httpx.HTTPError:
-        return None
-    if response.status_code != 200:
-        return None
-    handles = {
-        handle
-        for handle in _HF_X_LINK.findall(response.text)
-        if handle.casefold() not in _IGNORED_HANDLES
-    }
-    return handles.pop() if len(handles) == 1 else None
-
-
 def sota_credit(
     db: Session, paper: Paper, fetch_org_handle: Callable[[str], str | None]
 ) -> tuple[list[str], str | None]:
@@ -370,22 +303,11 @@ def sota_credit(
     authors). Every handle is a public account tied to the paper itself.
     """
     organization = paper.organizations[0] if paper.organizations else None
-    threads = db.execute(
-        select(PaperXThread.author_handle, PaperXThread.author_name)
-        .where(PaperXThread.paper_id == paper.id)
-        .order_by(PaperXThread.position)
-    ).all()
+    threads = paper_threads(db, paper.id)
     handles: list[str] = []
     if organization:
-        names = {organization.name.casefold(), (organization.slug or "").casefold()}
-        handles = [
-            handle
-            for handle, name in threads
-            if (name or "").casefold() in names or handle.casefold() in names
-        ][:1]
-        if not handles and organization.hf_slug:
-            handle = fetch_org_handle(organization.hf_slug)
-            handles = [handle] if handle else []
+        handle = organization_x_handle(organization, threads, fetch_org_handle)
+        handles = [handle] if handle else []
     if not handles:
         handles = [handle for handle, _ in threads][:2]
     handles = [h for h in dict.fromkeys(handles) if _X_HANDLE.fullmatch(h or "")]
@@ -609,10 +531,6 @@ def plan_kinds(db: Session, now: datetime) -> list[str]:
 # --- Writing --------------------------------------------------------------
 
 
-def numbers(text: str) -> set[str]:
-    return set(_NUMBER.findall(text))
-
-
 def accept_rewrite(
     draft: str, rewrite: str, *, facts: str = "", max_chars: int
 ) -> bool:
@@ -636,30 +554,16 @@ def write_with_luna(
         return insight.text  # a list reads best as is
     facts = json.dumps(insight.facts, ensure_ascii=False)
     try:
-        response = client.post(
-            RESPONSES_URL,
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": LUNA_MODEL,
-                "instructions": LUNA_INSTRUCTIONS,
-                "input": (
-                    f"Character limit: {max_chars}\n\nDraft:\n{insight.text}\n\n"
-                    f"Facts:\n{facts}"
-                ),
-                "store": False,
-                "max_output_tokens": 300,
-                "reasoning": {"effort": "none"},
-                "prompt_cache_key": "pwc-x-insight-v1",
-            },
+        rewrite = luna_text(
+            client,
+            api_key=api_key,
+            instructions=LUNA_INSTRUCTIONS,
+            prompt=(
+                f"Character limit: {max_chars}\n\nDraft:\n{insight.text}\n\n"
+                f"Facts:\n{facts}"
+            ),
+            cache_name="pwc-x-insight-v1",
         )
-        body = response.raise_for_status().json()
-        rewrite = "".join(
-            part["text"]
-            for item in body["output"]
-            if item.get("type") == "message"
-            for part in item.get("content", [])
-            if part.get("type") == "output_text"
-        ).strip()
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
         logger.warning("x_insight_rewrite_failed kind=%s %s", insight.kind, error)
         return insight.text

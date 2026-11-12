@@ -36,8 +36,7 @@ Generated from `deploy/cron_schedules.py`; update this table when you change it.
 | `pwc-cron-link-google-scholar-profiles.timer` | `Wed *-*-* 05:20:00` | `link_google_scholar_profiles` | `backend/scripts/link_google_scholar_profiles.py` |
 | `pwc-cron-refresh-conference-deadlines.timer` | `*-*-* 07:40:00`<br>`*-*-* 19:40:00` | `refresh_conference_deadlines` | `backend/scripts/refresh_conference_deadlines.py` |
 | `pwc-cron-discover-x-threads.timer` | `*-*-* 08,20:22:00` | `discover_x_threads` | `backend/scripts/discover_x_threads.py` |
-| `pwc-cron-post-trending-paper-to-x.timer` | `*-*-* 00/4:13:00` | `post_trending_paper_to_x` | `backend/scripts/post_trending_paper_to_x.py` |
-| `pwc-cron-post-x-insight.timer` | `*-*-* 09,17:43:00` | `post_x_insight` | `backend/scripts/post_x_insight.py` |
+| `pwc-cron-refresh-x-post-likes.timer` | `*-*-* *:35:00` | `refresh_x_post_likes` | `backend/scripts/refresh_x_post_likes.py` |
 | `pwc-cron-warm-paper-suggested-questions.timer` | `*-*-* *:33:00` | `warm_paper_suggested_questions` | `backend/scripts/warm_paper_suggested_questions.py` |
 | `pwc-cron-sync-3d-arena.timer` | `*-*-* *:05:00` | `sync_3d_arena` | `.github/workflows/scripts/hourly/sync_3d_arena.py` |
 | `pwc-cron-sync-mmteb-overall.timer` | `*-*-* *:07:00` | `sync_mmteb_overall` | `.github/workflows/scripts/hourly/sync_mmteb.py` overall |
@@ -46,15 +45,27 @@ Generated from `deploy/cron_schedules.py`; update this table when you change it.
 | `pwc-cron-sync-open-asr.timer` | `*-*-* *:15:00` | `sync_open_asr` | `.github/workflows/scripts/hourly/sync_open_asr.py` |
 | `pwc-cron-sync-open-tts.timer` | `*-*-* *:18:00` | `sync_open_tts` | `.github/workflows/scripts/hourly/sync_open_tts.py` |
 | `pwc-cron-sync-parsebench.timer` | `*-*-* *:20:00` | `sync_parsebench` | `.github/workflows/scripts/hourly/sync_parsebench.py` |
-| `pwc-cron-sync-mmteb-retrieval.timer` | `*-*-* *:22:00` | `sync_mmteb_retrieval` | `.github/workflows/scripts/hourly/sync_mmteb.py` retrieval |
 | `pwc-cron-sync-deepswe.timer` | `*-*-* *:25:00` | `sync_deepswe` | `.github/workflows/scripts/hourly/sync_deepswe.py` |
 | `pwc-cron-sync-extractbench.timer` | `*-*-* *:32:00` | `sync_extractbench` | `.github/workflows/scripts/hourly/sync_extractbench.py` |
 | `pwc-cron-sync-vals-finance-agent.timer` | `*-*-* *:47:00` | `sync_vals_finance_agent` | `.github/workflows/scripts/hourly/sync_vals_finance_agent.py` |
 | `pwc-cron-sync-surge-chartography.timer` | `*-*-* *:38:00` | `sync_surge_chartography` | `.github/workflows/scripts/hourly/sync_surge_chartography.py` |
+| `pwc-cron-sync-swe-marathon.timer` | `*-*-* *:26:00` | `sync_swe_marathon` | `.github/workflows/scripts/hourly/sync_swe_marathon.py` |
+| `pwc-cron-sync-jevbench.timer` | `*-*-* *:37:00` | `sync_jevbench` | `.github/workflows/scripts/hourly/sync_jevbench.py` |
 | `pwc-cron-sync-frontiercs-2.timer` | `*-*-* *:43:00` | `sync_frontiercs_2` | `.github/workflows/scripts/hourly/sync_frontiercs_2.py` |
+| `pwc-cron-sync-vals-index.timer` | `*-*-* *:03:00` | `sync_vals_index` | `.github/workflows/scripts/hourly/sync_vals_index.py` |
+| `pwc-cron-sync-swe-sweep.timer` | `*-*-* *:08:00` | `sync_swe_sweep` | `.github/workflows/scripts/hourly/sync_swe_sweep.py` |
+| `pwc-cron-sync-vending-bench-2.timer` | `*-*-* *:13:00` | `sync_vending_bench_2` | `.github/workflows/scripts/hourly/sync_vending_bench_2.py` |
+| `pwc-cron-sync-blueprint-bench-2.timer` | `*-*-* *:16:00` | `sync_blueprint_bench_2` | `.github/workflows/scripts/hourly/sync_blueprint_bench_2.py` |
+| `pwc-cron-sync-riemann-bench.timer` | `*-*-* *:23:00` | `sync_riemann_bench` | `.github/workflows/scripts/hourly/sync_riemann_bench.py` |
+| `pwc-cron-sync-cwe-bench.timer` | `*-*-* *:34:00` | `sync_cwe_bench` | `.github/workflows/scripts/hourly/sync_cwe_bench.py` |
+| `pwc-cron-sync-exploitgym.timer` | `*-*-* *:46:00` | `sync_exploitgym` | `.github/workflows/scripts/hourly/sync_exploitgym.py` |
+| `pwc-cron-sync-cybergym.timer` | `*-*-* *:09:00` | `sync_cybergym` | `.github/workflows/scripts/hourly/sync_cybergym.py` |
+| `pwc-cron-sync-patcheval-verified.timer` | `*-*-* *:21:00` | `sync_patcheval_verified` | `.github/workflows/scripts/hourly/sync_patcheval_verified.py` |
+| `pwc-cron-sync-critpt.timer` | `*-*-* 00/2:52:00` | `sync_critpt` | `.github/workflows/scripts/hourly/sync_critpt.py` |
+| `pwc-cron-sync-critpt-v2.timer` | `*-*-* 01/2:52:00` | `sync_critpt_v2` | `.github/workflows/scripts/hourly/sync_critpt_v2.py` |
+| `pwc-cron-sync-terminal-bench-science.timer` | `*-*-* 00/2:54:00` | `sync_terminal_bench_science` | `.github/workflows/scripts/hourly/sync_terminal_bench_science.py` |
 | `pwc-cron-sync-physics-iq-verified.timer` | `*-*-* *:28:00` | `sync_physics_iq_verified` | `.github/workflows/scripts/hourly/sync_physics_iq_verified.py` |
 | `pwc-cron-sync-artificial-analysis.timer` | `*-*-* 00/2:35:00` | `sync_artificial_analysis` | `.github/workflows/scripts/hourly/sync_artificial_analysis.py` |
-| `pwc-cron-sync-mmteb-reranking.timer` | `*-*-* *:37:00` | `sync_mmteb_reranking` | `.github/workflows/scripts/hourly/sync_mmteb.py` reranking |
 | `pwc-cron-sync-programbench.timer` | `*-*-* *:40:00` | `sync_programbench` | `.github/workflows/scripts/hourly/sync_programbench.py` |
 | `pwc-cron-sync-mmeb-v3.timer` | `*-*-* *:42:00` | `sync_mmeb_v3` | `.github/workflows/scripts/hourly/sync_mmeb.py` v3 |
 | `pwc-cron-sync-frontiercode.timer` | `*-*-* *:45:00` | `sync_frontiercode` | `.github/workflows/scripts/hourly/sync_frontiercode.py` |
@@ -175,6 +186,25 @@ history and stores them on repositories for the trending API/view pipeline.
 `update_citations.py` pulls citation counts from Semantic Scholar for ArXiv
 papers. Runs are bounded so hourly runs do not pile up under API throttling.
 
+`refresh_x_post_likes.py` tracks how fast linked X posts gain likes, for the
+X part of the paper trending score. Hourly at :35 it adds an `x_post_metrics`
+row for each `paper_x_threads` post from the last week, then reads each post
+about 1, 2, 4, 8, 12, 24, 48, 72, 120 and 144 hours after posting and keeps an
+EMA of likes per hour. Reads use the free embed syndication endpoint first and
+fall back to the paid X API (`X_API_BEARER_TOKEN`) for at most
+`PWC_X_LIKES_API_DAILY_CAP` posts per UTC day (default 300). It only reports,
+reading through syndication and rolling back, unless `PWC_X_LIKES_APPLY=true`.
+`calculate_paper_trending_scores` ranks each paper's fastest post from the last
+week against the others (posts under `PWC_TRENDING_X_MIN_LIKES_PER_HOUR`,
+default 1, count for nothing). The X rank only lifts a paper: the score is the
+higher of the GitHub/Hugging Face score and the X rank scaled by
+`PWC_TRENDING_X_WEIGHT` from `/etc/paperswithcode/trending-cron.env` (default 0
+= off, 1 = full lift).
+
+```bash
+uv run --env-file backend/keys.env python -m backend.scripts.refresh_x_post_likes --max-posts 20
+```
+
 `discover_x_threads.py` finds X posts in which authors introduce recent
 papers and links them to the paper page's "X threads" card. Twice a day it
 takes up to 40 arXiv papers from the last 10 days that are trending or featured
@@ -230,14 +260,27 @@ the most specific task, and one to three metrics; the backend validates and
 writes the rows, then requeues add-evals for the papers that reported the gap.
 Rejected candidates return for review once their paper count doubles; deferred
 ones after 14 days. Both kinds share the scheduler pause and run at most two at
-a time. Inspect or dry-run it with:
+a time.
+
+The same run then re-checks older papers against new leaderboards, however
+they were created (gap review, the add-benchmark skill, a sync, or by hand). For
+each dataset whose first `task_dataset_metrics` row is from the last two days,
+it reads the stored paper Markdown (else the abstract) of up to 50 of the
+newest papers already curated on that task before the board existed and with
+no row in the dataset's family, and queues add-evals (trigger
+`benchmark-promotion`, priority 50, policy `new-benchmark-<dataset id>`) for the
+papers that name it at least twice outside their references: at most 5 per
+benchmark and 20 per run, from at most 400 Markdown reads. The dispatcher runs
+at most two of these at once so daily curation keeps its workers. Inspect or
+dry-run it with:
 
 ```bash
 uv run --env-file backend/keys.env python -m backend.scripts.enqueue_benchmark_gap_review --status
+uv run --env-file backend/keys.env python -m backend.scripts.enqueue_benchmark_gap_review --dry-run
 ```
 
 `warm_paper_suggested_questions.py` pre-generates the three paper-page
-suggested questions (gpt-5.6-luna, stored in `paper_suggested_questions`) for
+suggested questions (gpt-6-luna, stored in `paper_suggested_questions`) for
 the papers visitors see first: the first three pages of the home feed's
 default view (trending, past week) and the first page of every task and method
 page (trending, busiest pages first). Papers that already have questions are
@@ -248,18 +291,50 @@ run only fills newcomers once the backlog is done. Count the work with:
 uv run --env-file backend/keys.env python -m backend.scripts.warm_paper_suggested_questions --dry-run
 ```
 
-`post_trending_paper_to_x.py` posts one trending paper to the Papers with
-Code X account (@paperswithcodee) every four hours. It takes the top
-`trending_score` arXiv paper from the last 14 days that has a TL;DR and was
-never posted, renders the first page of its PDF as an image, and posts the
-title, a blank line, and the Luna TL;DR with that image, then replies with the
-paper page link. `paper_x_posts` records each posted paper so none is posted
-twice. It needs the posting account's OAuth 1.0a keys in `production-cron.env`
-(`X_POST_CONSUMER_KEY`, `X_POST_CONSUMER_SECRET`, `X_POST_ACCESS_TOKEN`,
-`X_POST_ACCESS_TOKEN_SECRET`; the X app needs Read and Write permission) and
-only previews the post without them. Posts are capped at
+The Papers with Code X account (@paperswithcodee) is run by a writing agent
+outside this repository (a headless Claude Code session on the host). It does
+not touch the database; it calls `pwc-cron x_post_candidates list` for what is
+worth posting and `pwc-cron x_post_candidates record --kind K --subject-key S
+--post-id P [--reply-id R]` after each post. `list` prints one JSON object
+whose candidates carry a draft, the facts the agent may use, the page link,
+and a chart card as base64 PNG (or a page to screenshot): new SOTAs and new
+best open models on leaderboards with at least 5 entries, "What is X?"
+explainers for fast-rising methods, a weekly league of the labs holding the
+most first places, and the weekly and monthly trending roundups (see
+`backend/services/x_post_candidates.py`). Posted subjects go to
+`x_insight_posts`, so none is offered twice. Preview the candidates with:
+
+```bash
+uv run --env-file backend/keys.env python -m backend.scripts.x_post_candidates list | jq '.candidates[] | {kind, subject_key, draft}'
+```
+
+The two older posting scripts below are retired (no timer, no `pwc-cron`
+entry); their dry runs still work from a checkout.
+
+`post_trending_paper_to_x.py` posts at most one trending paper to the Papers
+with Code X account (@paperswithcodee) (00:13, 08:13, 16:13
+UTC), and only when one is worth it. It looks at the top ten `trending_score`
+arXiv papers from the last 14 days that have a TL;DR and were never posted,
+and keeps those with a clear SOTA (first on a Papers with Code leaderboard with
+at least 5 entries, ahead of every other paper's best by at least 1%) or a
+well-known lab whose official X account is known (`NOTABLE_X_HANDLES` in
+`backend/services/x_trending_post_service.py`, each handle checked on the X
+API; labs mapped to None need a reviewed thread posted by the lab or the
+single X link on its Hugging Face page). Papers with both go first. A SOTA post
+reads "Congrats @lab: <model> is SOTA on <benchmark>!" and the score against
+the previous best. Otherwise Luna (`PWC_OPENAI_API_KEY`) writes the post from
+the title, TL;DR, abstract, and leaderboard results; it is kept only if it uses
+no number outside those facts, exactly the lab @mentions, and opens with a
+comparison or a claim rather than a bare score or a small delta, else a
+template leads with such a TL;DR sentence. When nothing qualifies, the slot is
+skipped and each candidate's reason is in the run summary (`skipped`). The
+paper page link follows as a reply. `paper_x_posts` records each posted paper
+so none is posted twice. It needs the posting account's OAuth 1.0a keys in
+`production-cron.env` (`X_POST_CONSUMER_KEY`, `X_POST_CONSUMER_SECRET`,
+`X_POST_ACCESS_TOKEN`, `X_POST_ACCESS_TOKEN_SECRET`; the X app needs Read and
+Write permission) and only previews the post without them. Posts are capped at
 `PWC_X_POST_MAX_CHARS` (default 280; raise it when the account has X Premium
-long posts), dropping trailing TL;DR sentences to fit. Preview the next post
+long posts). Preview the next post (`template` in the output is the fallback)
 with:
 
 ```bash
@@ -298,7 +373,7 @@ against `papers.source_url`, paper titles, `model_releases`, and
 `model_release_radar_unindexed` warning. Releases from any other lab (for example Reflection's Beam,
 Aleph Alpha's Kolibri, or Meta's Muse Wonder) are found through a web news
 search: four Exa news queries over the last three days (`EXA_API_KEY`, about
-$0.09 per run) whose deduplicated headlines `gpt-5.6-luna` turns into
+$0.09 per run) whose deduplicated headlines `gpt-6-luna` turns into
 (lab, model, date, cited hits) releases (`OPENAI_API_KEY`). A web signal links
 the lab's own announcement page when one of the hits is from the lab, and a
 news article otherwise. Pass `--skip-web-search` to scan only the feeds and
@@ -333,7 +408,7 @@ pages for papers that still have `urls_extracted = false`. It is unscheduled
 
 `import_hf_daily_papers.py` runs hourly, imports the current day's Hugging Face
 papers that are not yet in the database, and auto-tags tasks/methods using
-keyword matching. New papers get a feed-style TL;DR from `gpt-5.6-luna`
+keyword matching. New papers get a feed-style TL;DR from `gpt-6-luna`
 (`backend/services/paper_tldr_service.py`, needs `PWC_OPENAI_API_KEY`); if that
 key is missing or the call fails, the Hugging Face `ai_summary` is stored instead.
 Each run also fills a TL;DR for up to 50 latest-version papers that have an
@@ -395,6 +470,27 @@ so unreviewed names and unresolved papers are logged as warnings. It creates
 missing mapped rows and rewrites managed rows' scores and methodology every
 run; managed rows that drop off the leaderboard are reported, never deleted.
 
+`sync_vals_index.py`, `sync_swe_sweep.py`, `sync_vending_bench_2.py`,
+`sync_blueprint_bench_2.py`, `sync_riemann_bench.py`, `sync_cwe_bench.py`, and
+`sync_exploitgym.py` keep the frontier boards added with Gemini 4 Carbon
+current; `sync_cybergym.py` (the site's default model-focused Level 1 view) and
+`sync_patcheval_verified.py` (the README results table) do the same for two
+more Cybersecurity boards, and `sync_critpt.py` / `sync_critpt_v2.py` keep the
+CritPt and CritPt v2 Scientific Reasoning boards current from the Artificial
+Analysis evaluation pages, as `sync_terminal_bench_science.py` does for
+Terminal-Bench-Science 0.1 (mini-SWE-agent rows beside the vendors' own runs) (the model records embedded in the server-rendered
+Next.js data, not the rate-limited Data API; CritPt rows that the model's own
+release already reports are kept and the rerun excluded). Each parses its official leaderboard in
+`backend/services/carbon_board_syncs.py` (failing on any layout change or an
+implausible row count) and hands the rows to the shared single-metric engine in
+`backend/services/live_leaderboard_sync.py`. Upstream names map to reviewed
+identities in `backend/services/carbon_board_identities.py`; other names are
+auto-matched or handed to the release radar, and a board's `excluded` names
+(partial runs, non-standard setups) are skipped. The engine keeps one row per
+catalog model and harness (the best upstream setting), adopts hand-imported
+rows for the same model, never creates papers, and reports managed rows that
+leave the leaderboard instead of deleting them.
+
 `sync_surge_chartography.py` parses the server-rendered "Chartography
 Leaderboard" block on https://surgehq.ai/benchmarks/chartography (provider,
 model with its reasoning configuration, Pass@1 percent) into the
@@ -411,6 +507,31 @@ unchanged), and adopts matching hand-imported rows, keeping their notes,
 `is_open`, `hf_model_url`, and `num_parameters`. Managed rows that drop off the
 leaderboard are reported, never deleted. The with-tools `chartography`
 benchmark is curated by hand and never touched.
+
+`sync_swe_marathon.py` keeps the `swe-marathon` benchmark on task
+`long-horizon-agents` equal to Abundant AI's v1.1 results. swe-marathon.org
+renders client-side, so the job reads the hashed `/assets/index-*.js` bundle
+the home page loads and decodes its embedded `{version:`v1.1`,tasks:...}`
+results. Resolution Rate is the share of a config's trials with reward 1 over
+all 20 tasks, as the site computes it; only complete runs (every task, the full
+trial count) count, and each model keeps its best reasoning effort per agent,
+named in the methodology rather than the row name. It fails on another results
+version, a pass count that disagrees with the trials, or a run count outside
+10–300. `adopt_unmanaged=False` keeps self-reported vendor rows (Kimi K3.1 Pro)
+beside Abundant AI's runs.
+
+`sync_jevbench.py` keeps the `jevbench` benchmark on task `decision-making`
+equal to Benchmark Heaven's official API board
+(https://benchmarkheaven.com/jev-models/api), read from
+`/api/jevbench/latest`: every row with an API-board rank, at its Composite
+Score (equal-weight harmonic mean of Intelligence, Calibration, Speed and
+Cost). Preliminary, unranked, wrapper and listed-only rows carry no rank and
+are skipped; the stale `benchmarkheaven/jevbench` Hub snapshot is not used.
+JevBench scores are not comparable across methods, so the job fails when the
+method label leaves `v1.7`, as well as on broken ranks, a composite out of rank
+order, or a board outside 20–300 rows. General LLMs measured as decision
+models keep their best reasoning setting; vendor systems without a catalog
+paper become release-radar signals, with the vendor taken from the source host.
 
 `sync_physics_iq_verified.py` parses the Physics-IQ Verified table in the
 official `google-deepmind/physics-IQ-benchmark` README (the

@@ -1,28 +1,26 @@
-"""Synchronize the official Physics-IQ Verified video generation leaderboard."""
+"""Live boards for the official Physics-IQ Verified video generation leaderboard.
+
+The README lists one table with an image-to-video (I2V) and a multi-frame
+(V2V) track. Each track is its own board on the shared benchmark, publishing
+its own metric through ``LiveLeaderboardSyncService``.
+"""
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from math import isfinite
-from typing import Any
 
 import httpx
-from sqlalchemy.orm import Session
 
-from backend.models.database import (
-    Dataset,
-    Evaluation,
-    Metric,
-    Paper,
-    PaperTask,
-    Task,
-    TaskDatasetMetric,
+from backend.services.leaderboard_sync_catalog import ModelIdentity
+from backend.services.live_leaderboard_sync import (
+    LeaderboardEntry,
+    LiveLeaderboard,
+    fetch_text,
 )
-from backend.services.evaluation_service import EvaluationService
-from backend.services.leaderboard_sync_ownership import managed_methodology_prefix
 
 # physics-iq-verified.anates.ai renders the same table from data compiled into
 # its Next.js bundle and exposes no JSON endpoint, so the README is canonical.
@@ -30,6 +28,8 @@ PHYSICS_IQ_README_URL = (
     "https://raw.githubusercontent.com/google-deepmind/physics-IQ-benchmark/"
     "main/README.md"
 )
+PHYSICS_IQ_URL = "https://github.com/google-deepmind/physics-IQ-benchmark"
+USER_AGENT = "paperswithcode-physics-iq-verified-sync/1.0"
 TASK_SLUG = "video-generation"
 DATASET_SLUG = "physics-iq-verified"
 METRIC_BY_TRACK = {
@@ -37,7 +37,6 @@ METRIC_BY_TRACK = {
     "v2v": "Physics-IQ Verified Score (V2V)",
 }
 TRACK_BY_INPUT_TYPE = {"i2v": "i2v", "multiframe (v2v)": "v2v"}
-MANAGED_METHODOLOGY_PREFIX = managed_methodology_prefix("Physics-IQ Verified")
 LEADERBOARD_HEADING = "### Physics-IQ Verified Leaderboard"
 TABLE_HEADER = (
     "#",
@@ -48,30 +47,23 @@ TABLE_HEADER = (
 )
 MIN_EXPECTED_ROWS = 30
 MAX_EXPECTED_ROWS = 300
-# Refuse to touch the managed leaderboard when the reviewed subset collapses.
-MIN_SELECTED_ENTRIES = 25
-
-
-@dataclass(frozen=True)
-class ModelIdentity:
-    """A reviewed leaderboard model and the paper that introduces it."""
-
-    model_name: str
-    arxiv_id: str | None = None
-    source_url: str | None = None
-    is_open: bool = False
-    hf_model_url: str | None = None
-
-    def __post_init__(self) -> None:
-        if (self.arxiv_id is None) == (self.source_url is None):
-            raise ValueError("ModelIdentity requires exactly one paper identity")
-
-    @property
-    def paper_key(self) -> str:
-        return self.arxiv_id or self.source_url or ""
+# Refuse to touch a track when its reviewed subset collapses.
+MIN_SELECTED_BY_TRACK = {"i2v": 20, "v2v": 5}
 
 
 _COSMOS_3 = "2606.02800"
+_COSMOS_3_SUPER = ModelIdentity(
+    "Cosmos3-Super",
+    arxiv_id=_COSMOS_3,
+    is_open=True,
+    hf_model_url="https://huggingface.co/nvidia/Cosmos3-Super",
+)
+_COSMOS_3_NANO = ModelIdentity(
+    "Cosmos3-Nano",
+    arxiv_id=_COSMOS_3,
+    is_open=True,
+    hf_model_url="https://huggingface.co/nvidia/Cosmos3-Nano",
+)
 _MAGI_1 = ModelIdentity("MAGI-1 24B", arxiv_id="2505.13211", is_open=True)
 _GEOPHYS = ModelIdentity(
     "MAGI-1 24B + GeoPhys (BoN)", arxiv_id="2606.20707", is_open=True
@@ -102,24 +94,15 @@ MODEL_IDENTITIES: dict[tuple[str, str], ModelIdentity] = {
     ("Magi-1 24B + GeoPhys (BoN) (op)", "i2v"): _GEOPHYS,
     ("Magi-1 24B (op)", "v2v"): _MAGI_1,
     ("Magi-1 24B (op)", "i2v"): _MAGI_1,
-    ("Cosmos3-Super", "v2v"): ModelIdentity(
-        "Cosmos3-Super",
-        arxiv_id=_COSMOS_3,
-        is_open=True,
-        hf_model_url="https://huggingface.co/nvidia/Cosmos3-Super",
-    ),
-    ("Cosmos3-Nano", "v2v"): ModelIdentity(
-        "Cosmos3-Nano",
-        arxiv_id=_COSMOS_3,
-        is_open=True,
-        hf_model_url="https://huggingface.co/nvidia/Cosmos3-Nano",
-    ),
-    ("Cosmos3-Nano", "i2v"): ModelIdentity(
-        "Cosmos3-Nano",
-        arxiv_id=_COSMOS_3,
-        is_open=True,
-        hf_model_url="https://huggingface.co/nvidia/Cosmos3-Nano",
-    ),
+    # NVIDIA's single-generation runs with GPT-6 Astra upsampled prompts; like
+    # the FLUX 3 prompt rows, the prompts change but the model is Cosmos 3.
+    ("Cosmos3-Super + Prompt Upsampling", "v2v"): _COSMOS_3_SUPER,
+    ("Cosmos3-Super + Prompt Upsampling", "i2v"): _COSMOS_3_SUPER,
+    ("Cosmos3-Nano + Prompt Upsampling", "v2v"): _COSMOS_3_NANO,
+    ("Cosmos3-Nano + Prompt Upsampling", "i2v"): _COSMOS_3_NANO,
+    ("Cosmos3-Super", "v2v"): _COSMOS_3_SUPER,
+    ("Cosmos3-Nano", "v2v"): _COSMOS_3_NANO,
+    ("Cosmos3-Nano", "i2v"): _COSMOS_3_NANO,
     ("Cosmos3-Super-Image2Video", "i2v"): ModelIdentity(
         "Cosmos3-Super-Image2Video",
         arxiv_id=_COSMOS_3,
@@ -254,23 +237,6 @@ def exclusion_reason(entry: PhysicsIqEntry) -> str | None:
     return None
 
 
-@dataclass
-class PhysicsIqSyncStats:
-    fetched: int = 0
-    matched: int = 0
-    created: int = 0
-    changed: int = 0
-    adopted: int = 0
-    excluded: dict[str, int] = field(default_factory=dict)
-    superseded: list[str] = field(default_factory=list)
-    unreviewed: list[str] = field(default_factory=list)
-    missing_papers: list[str] = field(default_factory=list)
-    missing_upstream: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return self.__dict__.copy()
-
-
 _LINK = re.compile(r"\[((?:\\.|[^\]\\])*)\]\(([^)\s]+)\)")
 _SMALL = re.compile(r"<small>(.*?)</small>")
 _REPORTED = re.compile(r"^(?P<model>.+?)\s+reported \[here\]\((?P<url>[^)\s]+)\)$")
@@ -383,262 +349,57 @@ def parse_physics_iq_leaderboard(markdown: str) -> list[PhysicsIqEntry]:
 def fetch_physics_iq_leaderboard(
     client: httpx.Client | None = None,
 ) -> list[PhysicsIqEntry]:
-    owned_client = client is None
-    active_client = client or httpx.Client(
-        timeout=httpx.Timeout(20, connect=5),
-        follow_redirects=True,
-        headers={"User-Agent": "paperswithcode-physics-iq-verified-sync/1.0"},
+    return parse_physics_iq_leaderboard(
+        fetch_text(PHYSICS_IQ_README_URL, client, user_agent=USER_AGENT)
     )
-    try:
-        response = active_client.get(PHYSICS_IQ_README_URL)
-        response.raise_for_status()
-        return parse_physics_iq_leaderboard(response.text)
-    finally:
-        if owned_client:
-            active_client.close()
 
 
-@dataclass(frozen=True)
-class Selection:
-    """Leaderboard rows to publish, one per reviewed model and track."""
-
-    entries: dict[tuple[ModelIdentity, str], PhysicsIqEntry]
-    excluded: dict[str, int]
-    superseded: list[str]
-    unreviewed: list[str]
-
-
-def select_entries(entries: list[PhysicsIqEntry]) -> Selection:
-    """Apply the import policy and keep each model's best single-generation run."""
-    selected: dict[tuple[ModelIdentity, str], PhysicsIqEntry] = {}
-    excluded: dict[str, int] = {}
-    superseded: list[str] = []
-    unreviewed: list[str] = []
-    for entry in entries:
-        reason = exclusion_reason(entry)
-        if reason is not None:
-            excluded[reason] = excluded.get(reason, 0) + 1
-            continue
-        identity = MODEL_IDENTITIES.get(entry.key)
-        if identity is None:
-            unreviewed.append(f"{entry.label} [{entry.track}]")
-            continue
-        key = (identity, entry.track)
-        current = selected.get(key)
-        if current is None or entry.score > current.score:
-            if current is not None:
-                superseded.append(f"{current.label} [{current.track}]")
-            selected[key] = entry
-        else:
-            superseded.append(f"{entry.label} [{entry.track}]")
-    return Selection(selected, excluded, superseded, unreviewed)
-
-
-_MANAGED_HEAD = re.compile(
-    re.escape(MANAGED_METHODOLOGY_PREFIX)
-    + r" Official leaderboard entry \"(?P<label>.+?)\" \((?P<track>i2v|v2v)\): "
-    r"(?P<score>[^,]+), added (?P<added>\d{4}-\d{2}-\d{2}), "
-    r"reported at (?P<report>\S+)\.(?: (?P<notes>.*))?$",
-    re.DOTALL,
-)
-
-
-def _methodology(entry: PhysicsIqEntry, notes: str) -> str:
-    head = (
-        f"{MANAGED_METHODOLOGY_PREFIX} Official leaderboard entry "
-        f'"{entry.label}" ({entry.track}): {entry.score_text}, added '
-        f"{entry.date_added.isoformat()}, reported at {entry.report_url}."
+def _leaderboard_entry(entry: PhysicsIqEntry) -> LeaderboardEntry:
+    return LeaderboardEntry(
+        entry.label,
+        entry.score,
+        f"{entry.score_text} ({entry.track}), added "
+        f"{entry.date_added.isoformat()}, report {entry.report_url}",
+        source_url=entry.report_url,
+        evaluated_on=entry.date_added,
     )
-    return f"{head} {notes}" if notes else head
 
 
-def _curated_notes(row: Evaluation) -> str:
-    """Return the reviewer-written methodology kept beneath the managed head."""
-    methodology = (row.methodology or "").strip()
-    head = _MANAGED_HEAD.match(methodology)
-    if head is not None:
-        return head.group("notes") or ""
-    return methodology
+BOARDS = {
+    track: LiveLeaderboard(
+        source="Physics-IQ Verified",
+        provider="physics-iq-verified",
+        url=PHYSICS_IQ_URL,
+        task_slug=TASK_SLUG,
+        dataset_slug=DATASET_SLUG,
+        metric=metric,
+        identities={
+            label: identity
+            for (label, identity_track), identity in MODEL_IDENTITIES.items()
+            if identity_track == track
+        },
+        min_selected=MIN_SELECTED_BY_TRACK[track],
+    )
+    for track, metric in METRIC_BY_TRACK.items()
+}
 
 
-def _score_matches(stored: Any, published: Decimal) -> bool:
-    """Treat a stored value as current when it rounds to the published one.
-
-    Reviewers sometimes import the unrounded submission value (48.23) that the
-    README lists at lower precision (48.2); that is not a revision.
-    """
-    if isinstance(stored, bool) or not isinstance(stored, (int, float)):
-        return False
-    exponent = published.as_tuple().exponent
-    places = -exponent if isinstance(exponent, int) and exponent < 0 else 0
-    return Decimal(str(stored)).quantize(Decimal(1).scaleb(-places)) == published
-
-
-class PhysicsIqSyncService:
-    """Create and revise reviewed Physics-IQ Verified rows; never create papers."""
-
-    def __init__(self, db: Session):
-        self.db = db
-
-    def _leaderboard_identity(self) -> tuple[Task, Dataset]:
-        task = self.db.query(Task).filter(Task.slug == TASK_SLUG).one_or_none()
-        dataset = (
-            self.db.query(Dataset).filter(Dataset.slug == DATASET_SLUG).one_or_none()
+def split_boards(
+    entries: list[PhysicsIqEntry],
+) -> list[tuple[LiveLeaderboard, list[LeaderboardEntry]]]:
+    """Drop excluded rows and hand each track's rows to its board."""
+    eligible = [entry for entry in entries if exclusion_reason(entry) is None]
+    return [
+        (
+            board,
+            [_leaderboard_entry(entry) for entry in eligible if entry.track == track],
         )
-        if task is None or dataset is None:
-            raise RuntimeError(
-                "Physics-IQ Verified task or benchmark is not configured"
-            )
-        metric_ids = [
-            metric_id
-            for (metric_id,) in self.db.query(Metric.id)
-            .filter(Metric.name.in_(METRIC_BY_TRACK.values()))
-            .all()
-        ]
-        configured = (
-            self.db.query(TaskDatasetMetric)
-            .filter(
-                TaskDatasetMetric.task_id == task.id,
-                TaskDatasetMetric.dataset_id == dataset.id,
-                TaskDatasetMetric.metric_id.in_(metric_ids),
-            )
-            .count()
-        )
-        if len(metric_ids) != len(METRIC_BY_TRACK) or configured != len(metric_ids):
-            raise RuntimeError("Physics-IQ Verified metrics are not linked to the task")
-        return task, dataset
+        for track, board in BOARDS.items()
+    ]
 
-    def _paper_ids(self) -> dict[str, int]:
-        """Resolve reviewed paper identities without ever creating papers."""
-        identities = MODEL_IDENTITIES.values()
-        arxiv_ids = {i.arxiv_id for i in identities if i.arxiv_id}
-        source_urls = {i.source_url for i in identities if i.source_url}
-        papers = (
-            self.db.query(Paper.id, Paper.arxiv_id, Paper.source_url)
-            .filter(
-                Paper.is_latest_version,
-                (Paper.arxiv_id.in_(arxiv_ids))
-                | ((Paper.source == "external") & Paper.source_url.in_(source_urls)),
-            )
-            .order_by(Paper.id)
-            .all()
-        )
-        resolved: dict[str, int] = {}
-        for paper_id, arxiv_id, source_url in papers:
-            key = arxiv_id if arxiv_id in arxiv_ids else source_url
-            resolved[key] = paper_id
-        return resolved
 
-    def sync(
-        self, entries: list[PhysicsIqEntry], *, commit: bool = True
-    ) -> PhysicsIqSyncStats:
-        selection = select_entries(entries)
-        if len(selection.entries) < MIN_SELECTED_ENTRIES:
-            raise RuntimeError(
-                f"Physics-IQ Verified has only {len(selection.entries)} reviewed "
-                "rows; refusing to update the managed leaderboard"
-            )
-        stats = PhysicsIqSyncStats(
-            fetched=len(entries),
-            excluded=selection.excluded,
-            superseded=selection.superseded,
-            unreviewed=selection.unreviewed,
-        )
-        try:
-            task, dataset = self._leaderboard_identity()
-            paper_ids = self._paper_ids()
-            rows = (
-                self.db.query(Evaluation)
-                .filter(
-                    Evaluation.task_id == task.id,
-                    Evaluation.dataset_id == dataset.id,
-                )
-                .order_by(Evaluation.id)
-                .all()
-            )
-            rows_by_identity: dict[tuple[int, str, str], Evaluation] = {}
-            for row in rows:
-                for metric_name in row.metrics or {}:
-                    rows_by_identity.setdefault(
-                        (row.paper_id, row.model_name, metric_name), row
-                    )
-            linked_paper_ids = {
-                paper_id
-                for (paper_id,) in self.db.query(PaperTask.paper_id)
-                .filter(PaperTask.task_id == task.id)
-                .all()
-            }
-            now = datetime.now(UTC)
-            published: set[int] = set()
-            for (identity, track), entry in selection.entries.items():
-                paper_id = paper_ids.get(identity.paper_key)
-                if paper_id is None:
-                    stats.missing_papers.append(f"{entry.label} [{track}]")
-                    continue
-                metric_name = METRIC_BY_TRACK[track]
-                metrics = {metric_name: float(entry.score)}
-                row = rows_by_identity.get((paper_id, identity.model_name, metric_name))
-                if row is None:
-                    row = Evaluation(
-                        paper_id=paper_id,
-                        task_id=task.id,
-                        dataset_id=dataset.id,
-                        model_name=identity.model_name,
-                        metrics=metrics,
-                        is_open=identity.is_open,
-                        hf_model_url=identity.hf_model_url,
-                        external_source_url=entry.report_url,
-                        source_url=entry.report_url,
-                        external=True,
-                        uses_additional_data=False,
-                    )
-                    self.db.add(row)
-                    stats.created += 1
-                    notes = ""
-                else:
-                    # Adopted rows keep their reviewed provenance fields; only
-                    # the leaderboard-owned score and methodology head change.
-                    notes = _curated_notes(row)
-                    managed = _MANAGED_HEAD.match((row.methodology or "").strip())
-                    current = _score_matches(
-                        (row.metrics or {}).get(metric_name), entry.score
-                    )
-                    if managed is None:
-                        stats.adopted += 1
-                    revised_head = row.methodology != _methodology(entry, notes)
-                    if not current or (managed is not None and revised_head):
-                        stats.changed += 1
-                    if not current:
-                        row.metrics = metrics
-                row.methodology = _methodology(entry, notes)
-                row.best_metric = metric_name
-                row.evaluated_on = entry.date_added
-                row.updated_at = now
-                if paper_id not in linked_paper_ids:
-                    self.db.add(
-                        PaperTask(paper_id=paper_id, task_id=task.id, source="auto")
-                    )
-                    linked_paper_ids.add(paper_id)
-                published.add(id(row))
-                stats.matched += 1
-
-            stats.missing_upstream = sorted(
-                f"{row.model_name} [{row.best_metric}]"
-                for row in rows
-                if id(row) not in published
-                and _MANAGED_HEAD.match((row.methodology or "").strip())
-            )
-            self.db.flush()
-            ranking = EvaluationService(self.db)
-            for metric_name in METRIC_BY_TRACK.values():
-                ranking.recalculate_ranks(
-                    task.id, dataset.id, metric_name=metric_name, commit=False
-                )
-            if commit:
-                self.db.commit()
-            else:
-                self.db.rollback()
-            return stats
-        except Exception:
-            self.db.rollback()
-            raise
+def fetch_physics_iq_boards(
+    client: httpx.Client | None = None,
+) -> list[tuple[LiveLeaderboard, list[LeaderboardEntry]]]:
+    """Fetch the README once and split its rows into the two track boards."""
+    return split_boards(fetch_physics_iq_leaderboard(client))

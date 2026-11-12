@@ -10,21 +10,26 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from backend.database.connection import db_manager
+from backend.database.connection import db_manager, get_database_session
 from backend.models.database import Paper, Task
 from backend.models.database.research import (
     ResearchFollow,
-    ResearchSubscription,
     ResearchTopic,
+    ResearchTopicFollow,
+    ResearchTopicPreview,
     ResearchTopicVerdict,
 )
 from backend.models.research import ResearchEntry
 from backend.services import research_delivery_service as delivery
 from backend.services import research_follow_service as follows
+from backend.routers import research
 from backend.services import research_topic_service as topics
+from backend.utils.auth import require_user
 
 UTC = timezone.utc
 
@@ -41,6 +46,13 @@ def db():
         ) as session:
             yield session
         transaction.rollback()
+
+
+@pytest.fixture(autouse=True)
+def offline(monkeypatch):
+    """No LLM label or embedding preview unless a test provides one."""
+    monkeypatch.setattr(topics, "summarize", lambda _: None)
+    monkeypatch.setattr(topics, "save_preview", lambda *_: None)
 
 
 @pytest.fixture
@@ -106,6 +118,37 @@ def test_jev_judge_chunks_topics_and_reads_noul_scores():
     assert scores[:2] == [0.5, 0.51] and scores[10:] == [0.5, 0.51]
 
 
+def test_summarize_labels_only_long_descriptions(monkeypatch):
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        topics, "get_settings", lambda: type("S", (), {"openai_api_key": "k"})()
+    )
+    requests = []
+
+    def post(url, **kwargs):
+        requests.append(kwargs["json"]["input"])
+        output = [
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": " “Real-time neural audio synthesis.” ",
+                    }
+                ],
+            }
+        ]
+        return httpx.Response(
+            200, json={"output": output}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(topics.httpx, "post", post)
+    assert topics.summarize("audio generation") is None
+    long = "I'm very interested in AI-driven audio generation, fast enough for realtime use."
+    assert topics.summarize(long) == "Real-time neural audio synthesis"
+    assert requests == [long]
+
+
 def entry(key, interests, published="2026-10-10"):
     return ResearchEntry(
         paper_key=key,
@@ -137,33 +180,90 @@ def test_digest_leads_with_topic_section():
     assert "NEW ON YOUR TOPIC" not in alone["text"]
 
 
-def test_set_topic_shares_rows_by_normalized_text(db, now):
-    topics.set_topic(db, "alice", "Real-time video generation.", now)
-    topics.set_topic(db, "bob", "  real-time VIDEO generation", now)
-    alice = db.get(ResearchSubscription, "alice")
-    bob = db.get(ResearchSubscription, "bob")
-    assert alice.topic_id == bob.topic_id
-    topic = db.get(ResearchTopic, alice.topic_id)
+def test_follow_topic_shares_rows_by_normalized_text(db, now):
+    alice = topics.follow_topic(db, "alice", "Real-time video generation.", now)
+    bob = topics.follow_topic(db, "bob", "  real-time VIDEO generation", now)
+    assert alice == bob
+    topic = db.get(ResearchTopic, alice)
     assert topic.text == "Real-time video generation."
     assert topic.backfill_status == "pending"
-    topics.set_topic(db, "alice", None, now)
-    assert db.get(ResearchSubscription, "alice").topic_id is None
-    assert topics.topic_view(db, "alice") is None
+    topics.unfollow_topic(db, "alice", alice)
+    assert topics.topic_views(db, "alice") == []
+    assert [t.id for t in topics.topic_views(db, "bob")] == [bob]
 
 
-def test_set_topic_suggests_exact_catalog_names(db, now):
+def test_accounts_follow_several_topics_up_to_the_limit(db, now, monkeypatch):
+    monkeypatch.setattr(topics, "MAX_TOPICS", 2)
+    video = topics.follow_topic(db, "alice", "video generation", now)
+    speech = topics.follow_topic(
+        db, "alice", "speech recognition", now + timedelta(seconds=1)
+    )
+    # Following a topic already followed is a no-op, even at the limit.
+    assert topics.follow_topic(db, "alice", "Video generation", now) == video
+    with pytest.raises(OverflowError):
+        topics.follow_topic(db, "alice", "robot learning", now)
+    assert [t.text for t in topics.topic_views(db, "alice")] == [
+        "video generation",
+        "speech recognition",
+    ]
+    # Replacing a topic frees its slot; replacing one not followed fails.
+    robots = topics.follow_topic(db, "alice", "robot learning", now, replace=video)
+    assert {t.id for t in topics.topic_views(db, "alice")} == {speech, robots}
+    with pytest.raises(LookupError):
+        topics.follow_topic(db, "alice", "anything", now, replace=video)
+    # Replacing with another followed topic's text merges the two.
+    topics.follow_topic(db, "alice", "speech recognition", now, replace=robots)
+    assert [t.id for t in topics.topic_views(db, "alice")] == [speech]
+    topics.follow_topic(db, "alice", "video generation", now)
+    topics.unfollow_topic(db, "alice")
+    assert db.query(ResearchTopicFollow).filter_by(hf_subject="alice").count() == 0
+
+
+def test_follow_topic_suggests_catalog_names(db, now):
     db.add(Task(name="Speech Recognition", slug="speech-recognition-topic-test"))
+    db.add(Task(name="Time-series forecasting", slug="time-series-topic-test"))
     db.flush()
-    topics.set_topic(db, "alice", "speech recognition", now)
-    view = topics.topic_view(db, "alice")
+    topics.follow_topic(db, "alice", "speech recognition", now)
+    (view,) = topics.topic_views(db, "alice")
     assert [(s.kind, s.name) for s in view.suggestions] == [
         ("task", "Speech Recognition")
     ]
+    # Case, punctuation and hyphens do not matter; narrower phrasings do.
+    assert [s.name for s in topics.suggestions(db, "Time series forecasting.")] == [
+        "Time-series forecasting"
+    ]
+    assert topics.suggestions(db, "time series forecasting for retail") == []
+    assert topics.suggestions(db, "深度学习") == []
+
+
+def test_topic_api_refuses_catalog_names_and_lists_them(db, monkeypatch):
+    app = FastAPI()
+    app.include_router(research.router)
+    app.dependency_overrides[get_database_session] = lambda: db
+    app.dependency_overrides[require_user] = lambda: {"hf_subject": "alice"}
+    monkeypatch.setattr(research, "decode_request_session", lambda request: {})
+    db.add(Task(name="Harness Engineering", slug="harness-engineering-topic-test"))
+    db.flush()
+    client = TestClient(app)
+    refused = client.post("/me/topics", json={"text": "harness engineering"})
+    assert refused.status_code == 409
+    assert "follow Harness Engineering instead" in refused.json()["detail"]
+    agents = client.post("/me/topics", json={"text": "agent harnesses"}).json()
+    reword = client.put(
+        f"/me/topics/{agents['id']}", json={"text": "Harness-Engineering"}
+    )
+    assert reword.status_code == 409
+    matches = client.get(
+        "/research/topic-matches", params={"text": "harness  engineering"}
+    )
+    assert [(m["kind"], m["name"], m["url"]) for m in matches.json()] == [
+        ("task", "Harness Engineering", "/tasks/harness-engineering-topic-test")
+    ]
+    assert client.get("/research/topic-matches", params={"text": "agents"}).json() == []
 
 
 def test_judge_skips_current_verdicts_and_rejudges_changed_cards(db, now):
-    topics.set_topic(db, "alice", "video generation", now)
-    topic_id = db.get(ResearchSubscription, "alice").topic_id
+    topic_id = topics.follow_topic(db, "alice", "video generation", now)
     video = paper(db, now, "1", "Video diffusion at scale")
     other = paper(db, now, "2", "Protein folding")
     judge = FakeJudge()
@@ -185,8 +285,7 @@ def test_judge_skips_current_verdicts_and_rejudges_changed_cards(db, now):
 
 
 def test_judge_failures_stay_unjudged_for_the_next_run(db, now):
-    topics.set_topic(db, "alice", "video generation", now)
-    topic_id = db.get(ResearchSubscription, "alice").topic_id
+    topic_id = topics.follow_topic(db, "alice", "video generation", now)
     flaky = paper(db, now, "1", "Video flaky")
     judge = FakeJudge(fail_titles=("Video flaky",))
     assert topics.judge_papers(db, judge, {topic_id: "video"}, [flaky.id]) == (0, 1)
@@ -198,8 +297,9 @@ def test_judge_failures_stay_unjudged_for_the_next_run(db, now):
 
 
 def test_claim_backfill_skips_unfollowed_recent_retries_and_live_claims(db, now):
-    topics.set_topic(db, "alice", "video generation", now)
-    topic = db.get(ResearchTopic, db.get(ResearchSubscription, "alice").topic_id)
+    topic = db.get(
+        ResearchTopic, topics.follow_topic(db, "alice", "video generation", now)
+    )
     db.add(ResearchTopic(text="orphan", normalized="orphan"))
     db.flush()
     claimed = topics.claim_backfill(db, now)
@@ -214,7 +314,7 @@ def test_claim_backfill_skips_unfollowed_recent_retries_and_live_claims(db, now)
 
 
 def test_backfill_judges_window_and_recall_then_retries_failures(db, now, monkeypatch):
-    topics.set_topic(db, "alice", "video generation", now)
+    topics.follow_topic(db, "alice", "video generation", now)
     recent = paper(db, now, "1", "Video recent")
     old = paper(db, now, "2", "Video old", days=400)
     paper(db, now, "3", "Video unrecalled", days=400)
@@ -230,8 +330,30 @@ def test_backfill_judges_window_and_recall_then_retries_failures(db, now, monkey
     assert [title for title, _ in judge.calls] == ["Title: Video old"]
 
 
+def test_backfill_stops_recall_when_a_batch_stops_matching(db, now, monkeypatch):
+    topics.follow_topic(db, "alice", "video generation", now)
+    titles = ["Video a", "Video b", "Audio c", "Audio d", "Video e"]
+    older = [
+        paper(db, now, str(i), title, days=400).id for i, title in enumerate(titles)
+    ]
+    monkeypatch.setattr(topics, "recall_older", lambda *_: older)
+    monkeypatch.setattr(topics, "window_paper_ids", lambda *_: [])
+    monkeypatch.setattr(topics, "RECALL_BATCH", 2)
+    monkeypatch.setattr(topics, "MIN_BATCH_HITS", 1)
+    topic = topics.claim_backfill(db, now)
+    judge = FakeJudge()
+    assert topics.backfill(db, judge, topic, now) == "done"
+    assert sorted(title for title, _ in judge.calls) == [
+        "Title: Audio c",
+        "Title: Audio d",
+        "Title: Video a",
+        "Title: Video b",
+    ]
+    assert topic.backfill_total == 4 and topic.backfill_done == 4
+
+
 def test_backfill_gives_up_after_max_attempts(db, now, monkeypatch):
-    topics.set_topic(db, "alice", "video generation", now)
+    topics.follow_topic(db, "alice", "video generation", now)
     monkeypatch.setattr(topics, "recall_older", lambda *_: [])
     flaky = paper(db, now, "1", "Video flaky")
     monkeypatch.setattr(topics, "window_paper_ids", lambda *_: [flaky.id])
@@ -241,7 +363,7 @@ def test_backfill_gives_up_after_max_attempts(db, now, monkeypatch):
         status = topics.backfill(db, FakeJudge(("Video flaky",)), topic, when)
         when += timedelta(minutes=11)
     assert status == "failed"
-    topics.set_topic(db, "bob", "video generation", now)
+    topics.follow_topic(db, "bob", "video generation", now)
     assert topic.backfill_status == "pending" and topic.backfill_attempts == 0
 
 
@@ -250,8 +372,7 @@ def test_feed_merges_topic_and_entity_hits_with_reasons(db, now):
     db.add(task)
     db.flush()
     db.add(ResearchFollow(hf_subject="alice", kind="task", entity_id=task.id))
-    topics.set_topic(db, "alice", "video generation", now)
-    topic_id = db.get(ResearchSubscription, "alice").topic_id
+    topic_id = topics.follow_topic(db, "alice", "video generation", now)
     both = paper(db, now, "1", "Video robots")
     topic_only = paper(db, now, "2", "Video only")
     below = paper(db, now, "3", "Video weak")
@@ -283,9 +404,9 @@ def test_feed_merges_topic_and_entity_hits_with_reasons(db, now):
     assert set(entries) == {"Video robots", "Video only", "Robot only"}
     assert set(entries["Video robots"].reasons) == {
         "Robotics",
-        "“video generation”",
+        "“Video generation”",
     }
-    assert entries["Video only"].reasons == ["“video generation”"]
+    assert entries["Video only"].reasons == ["“Video generation”"]
     assert entries["Robot only"].reasons == ["Robotics"]
     topic_only = {
         e.title: e
@@ -294,5 +415,120 @@ def test_feed_merges_topic_and_entity_hits_with_reasons(db, now):
     assert set(topic_only) == {"Video robots", "Video only"}
     assert set(topic_only["Video robots"].reasons) == {
         "Robotics",
-        "“video generation”",
+        "“Video generation”",
     }
+    other = topics.follow_topic(db, "alice", "protein folding", now)
+    db.add(
+        ResearchTopicVerdict(
+            topic_id=other,
+            paper_id=entity_only.id,
+            score=0.9,
+            card_sha="0" * 64,
+            policy_version=topics.POLICY_VERSION,
+        )
+    )
+    db.flush()
+    one = follows.feed_entries(db, "alice", now, 0, 40, topic_ids=[other])
+    assert [(e.title, set(e.reasons)) for e in one] == [
+        ("Robot only", {"Robotics", "“Protein folding”"})
+    ]
+    assert len(follows.feed_entries(db, "alice", now, 0, 40, topic_only=True)) == 3
+    by_task = follows.feed_entries(db, "alice", now, 0, 40, follows=[("task", task.id)])
+    assert {e.title for e in by_task} == {"Video robots", "Robot only"}
+    assert (
+        follows.feed_entries(db, "alice", now, 0, 40, follows=[("method", task.id)])
+        == []
+    )
+    # Several bubbles show papers matching any of them.
+    both_topics = follows.feed_entries(
+        db, "alice", now, 0, 40, topic_ids=[topic_id, other]
+    )
+    assert {e.title for e in both_topics} == {
+        "Video robots",
+        "Video only",
+        "Robot only",
+    }
+    topic_or_task = follows.feed_entries(
+        db, "alice", now, 0, 40, topic_ids=[topic_id], follows=[("task", task.id)]
+    )
+    assert {e.title for e in topic_or_task} == {
+        "Video robots",
+        "Video only",
+        "Robot only",
+    }
+    method_or_other = follows.feed_entries(
+        db, "alice", now, 0, 40, topic_ids=[other], follows=[("method", task.id)]
+    )
+    assert [e.title for e in method_or_other] == ["Robot only"]
+
+
+def test_preview_fills_the_feed_until_the_backfill_is_done(db, now, monkeypatch):
+    monkeypatch.setattr(topics, "summarize", lambda _: "Real-time audio synthesis")
+    preview = paper(db, now, "1", "Audio nearest")
+    judged = paper(db, now, "2", "Audio judged")
+
+    def save_preview(db, topic, now):
+        db.add(ResearchTopicPreview(topic_id=topic.id, paper_id=preview.id))
+        db.flush()
+
+    monkeypatch.setattr(topics, "save_preview", save_preview)
+    topics.follow_topic(db, "alice", "audio " + "x" * 80, now)
+    assert topics.topic_views(db, "alice")[0].label == "Real-time audio synthesis"
+    entries = follows.feed_entries(db, "alice", now, 0, 40)
+    assert [(e.title, e.reasons) for e in entries] == [
+        ("Audio nearest", ["“Real-time audio synthesis”"])
+    ]
+    monkeypatch.setattr(topics, "recall_older", lambda *_: [])
+    monkeypatch.setattr(topics, "window_paper_ids", lambda *_: [judged.id])
+    topic = topics.claim_backfill(db, now)
+    assert topics.backfill(db, FakeJudge(), topic, now) == "done"
+    assert [e.title for e in follows.feed_entries(db, "alice", now, 0, 40)] == [
+        "Audio judged"
+    ]
+
+
+def test_saving_again_retries_a_missing_label_and_preview(db, now, monkeypatch):
+    previews = []
+    monkeypatch.setattr(topics, "save_preview", lambda *_: previews.append(1))
+    topics.follow_topic(db, "alice", "audio " + "x" * 80, now)
+    assert topics.topic_views(db, "alice")[0].label is None
+    monkeypatch.setattr(topics, "summarize", lambda _: "Audio")
+    topics.follow_topic(db, "alice", "audio " + "x" * 80, now)
+    assert topics.topic_views(db, "alice")[0].label == "Audio"
+    assert len(previews) == 2
+
+
+def test_topic_api_follows_several_and_keeps_the_single_topic_routes(db, monkeypatch):
+    app = FastAPI()
+    app.include_router(research.router)
+    app.dependency_overrides[get_database_session] = lambda: db
+    app.dependency_overrides[require_user] = lambda: {"hf_subject": "alice"}
+    monkeypatch.setattr(research, "decode_request_session", lambda request: {})
+    monkeypatch.setattr(topics, "MAX_TOPICS", 2)
+    client = TestClient(app)
+    assert client.get("/me/topics").json() == []
+    assert client.get("/me/topic").json() is None
+    video = client.post("/me/topics", json={"text": "video generation"})
+    assert video.status_code == 201
+    speech = client.post("/me/topics", json={"text": "speech recognition"}).json()
+    assert client.post("/me/topics", json={"text": "robots"}).status_code == 409
+    assert client.post("/me/topics", json={"text": "  .. "}).status_code == 422
+    robots = client.put(f"/me/topics/{video.json()['id']}", json={"text": "robots"})
+    assert robots.json()["text"] == "robots"
+    assert client.put("/me/topics/0", json={"text": "robots"}).status_code == 404
+    # An edited topic keeps its place in the account's order.
+    assert [t["text"] for t in client.get("/me/topics").json()] == [
+        "robots",
+        "speech recognition",
+    ]
+    # The single-topic routes read and replace the account's first topic.
+    assert client.get("/me/topic").json()["id"] == robots.json()["id"]
+    assert client.put("/me/topic", json={"text": "audio"}).json()["text"] == "audio"
+    assert [t["text"] for t in client.get("/me/topics").json()] == [
+        "audio",
+        "speech recognition",
+    ]
+    assert client.delete(f"/me/topics/{speech['id']}").status_code == 204
+    assert [t["text"] for t in client.get("/me/topics").json()] == ["audio"]
+    assert client.delete("/me/topic").status_code == 204
+    assert client.get("/me/topics").json() == []

@@ -15,20 +15,24 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
-    Dataset,
     Evaluation,
     HfArtifact,
-    Metric,
     Paper,
     PaperHfArtifact,
     PaperProjectPage,
     PaperRepository,
     ProjectPage,
     Repository,
-    Task,
-    TaskDatasetMetric,
 )
 from backend.services.evaluation_service import EvaluationService
+from backend.services.leaderboard_model_matching_service import (
+    LeaderboardModel,
+    LeaderboardModelMatcher,
+    link_owner,
+)
+from backend.services.leaderboard_sync_catalog import (
+    resolve_leaderboard,
+)
 from backend.services.leaderboard_sync_ownership import managed_methodology_prefix
 
 TABARENA_SOURCE_URL = "https://huggingface.co/spaces/TabArena/leaderboard"
@@ -110,6 +114,7 @@ class TabArenaSyncStats:
     created: int = 0
     updated: int = 0
     deleted: int = 0
+    auto_matched: list[str] = field(default_factory=list)
     unmatched_sources: list[str] = field(default_factory=list)
     missing_papers: list[str] = field(default_factory=list)
 
@@ -120,6 +125,7 @@ class TabArenaSyncStats:
             "created": self.created,
             "updated": self.updated,
             "deleted": self.deleted,
+            "auto_matched": self.auto_matched,
             "unmatched_sources": self.unmatched_sources,
             "missing_papers": self.missing_papers,
         }
@@ -319,32 +325,23 @@ def _hf_repo_id(url: str) -> str | None:
     return "/".join(parts)
 
 
+def _leaderboard_model(entry: TabArenaEntry) -> LeaderboardModel:
+    """The model without its TabArena variant, published by its link's owner.
+
+    The CSV has no organization column, so the lab is the GitHub or Hugging
+    Face account (or blog author) of the model's link. Other links point at
+    classic baselines' papers or docs; they get no lab, so they never take a
+    release-radar slot.
+    """
+    owner = link_owner(entry.model_url) or ""
+    return LeaderboardModel(entry.model_name.rsplit(" (", 1)[0], owner)
+
+
 class TabArenaSyncService:
     """Replace only evaluation rows owned by the TabArena live sync."""
 
     def __init__(self, db: Session):
         self.db = db
-
-    def _leaderboard_identity(self) -> tuple[Task, Dataset]:
-        task = self.db.query(Task).filter(Task.slug == TASK_SLUG).one_or_none()
-        dataset = (
-            self.db.query(Dataset).filter(Dataset.slug == DATASET_SLUG).one_or_none()
-        )
-        metric = self.db.query(Metric).filter(Metric.name == METRIC_NAME).one_or_none()
-        if task is None or dataset is None or metric is None:
-            raise RuntimeError("TabArena task, benchmark, or metric is not configured")
-        configured = (
-            self.db.query(TaskDatasetMetric)
-            .filter(
-                TaskDatasetMetric.task_id == task.id,
-                TaskDatasetMetric.dataset_id == dataset.id,
-                TaskDatasetMetric.metric_id == metric.id,
-            )
-            .one_or_none()
-        )
-        if configured is None:
-            raise RuntimeError("TabArena Elo metric is not linked to the task")
-        return task, dataset
 
     def _paper_ids_by_url(
         self, entries: list[TabArenaEntry]
@@ -436,7 +433,9 @@ class TabArenaSyncService:
         stats = TabArenaSyncStats(fetched=len(entries))
 
         try:
-            task, dataset = self._leaderboard_identity()
+            task, dataset = resolve_leaderboard(
+                self.db, "TabArena", TASK_SLUG, DATASET_SLUG, (METRIC_NAME,)
+            )
             paper_ids_by_url, missing_arxiv = self._paper_ids_by_url(entries)
             stats.missing_papers.extend(sorted(missing_arxiv))
             managed_rows = (
@@ -452,16 +451,39 @@ class TabArenaSyncService:
             )
             managed_by_name = {row.model_name: row for row in managed_rows}
             upstream_names = {entry.model_name for entry in entries}
+            # Links without an indexed paper go to the shared matcher; the rest
+            # become release-radar signals. A missing arXiv paper is a
+            # catalog gap reported separately, not an unknown model.
+            unknown = {
+                entry.model_name: _leaderboard_model(entry)
+                for entry in entries
+                if entry.model_url not in paper_ids_by_url
+                and not any(
+                    item.startswith(f"{entry.model_url}:") for item in missing_arxiv
+                )
+            }
+            matcher = LeaderboardModelMatcher(
+                self.db,
+                provider="tabarena",
+                leaderboard_name="TabArena",
+                leaderboard_url=TABARENA_SOURCE_URL,
+            )
+            auto_matched = matcher.match(list(unknown.values()))
 
             for entry in entries:
                 paper_id = paper_ids_by_url.get(entry.model_url)
-                if paper_id is None:
-                    if not any(
-                        item.startswith(f"{entry.model_url}:") for item in missing_arxiv
-                    ):
+                hf_model_url = entry.model_url if _hf_repo_id(entry.model_url) else None
+                if entry.model_name in unknown:
+                    match = auto_matched.get(unknown[entry.model_name].name)
+                    if match is None:
                         stats.unmatched_sources.append(
                             f"{entry.model_name}:{entry.model_url}"
                         )
+                        continue
+                    paper_id = match.paper_id
+                    hf_model_url = hf_model_url or match.hf_model_url
+                    stats.auto_matched.append(entry.model_name)
+                if paper_id is None:
                     continue
 
                 methodology = (
@@ -499,12 +521,13 @@ class TabArenaSyncService:
                 row.external_source_url = TABARENA_SOURCE_URL
                 row.source_url = TABARENA_SOURCE_URL
                 row.external = True
-                row.hf_model_url = (
-                    entry.model_url if _hf_repo_id(entry.model_url) else None
-                )
+                row.hf_model_url = hf_model_url
                 row.updated_at = now
                 stats.matched += 1
 
+            matcher.report_unmatched(
+                [model for model in unknown.values() if model.name not in auto_matched]
+            )
             for row in managed_rows:
                 if row.model_name not in upstream_names:
                     self.db.delete(row)

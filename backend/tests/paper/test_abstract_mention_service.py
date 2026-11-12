@@ -113,6 +113,7 @@ CATALOG = [
     dataset(72, "CIFAR-10"),
     dataset(73, "CIFAR-100"),
     dataset(74, "LIBERO v2"),
+    CatalogEntity("method", 128, "Pass@1", "pass-1", aliases=("pass@k",)),
 ]
 INDEX = build_index(CATALOG)
 
@@ -289,6 +290,62 @@ def test_bare_benchmark_name_links_its_latest_explicit_version():
 def test_locally_defined_abbreviations_are_not_linked():
     assert links("Inadequate Generalization (IG) and later IG again") == []
     assert links("attributions via IG are noisy") == [("IG", "method", 19)]
+
+
+ACRONYM_INDEX = build_index(
+    [
+        method(1, "Reinforcement Fine-Tuning", "Reinforcement Fine-Tuning (RFT)"),
+        method(2, "RLHF", "Reinforcement Learning from Human Feedback (RLHF)"),
+        method(3, "Supervised Fine-Tuning (SFT)"),
+        method(4, "Tiny Recursive Model", "Tiny Recursive Model (TRM)"),
+        method(5, "Vision Transformer", "Vision Transformer (ViT)"),
+        method(6, "Direct Preference Optimization (DPO)"),
+        method(7, "Model Predictive Control", "Model Predictive Control (MPC)"),
+        method(8, "Masked Language Model", "Masked Language Model (MLM)"),
+    ]
+)
+
+
+def acronym_links(text):
+    return [(c.surface, c.entity_id) for c in find_candidates(text, ACRONYM_INDEX)]
+
+
+def test_abbreviation_redefined_with_overlapping_words_is_not_linked():
+    # "fine" and "tuning" overlap Reinforcement Fine-Tuning, but "rejection
+    # sampling" makes the expansion another method.
+    text = "we apply Rejection sampling Fine-Tuning (RFT). RFT uses samples"
+    assert acronym_links(text) == []
+    assert acronym_links("we train a Thinking Reward Model (TRM); TRM scores") == []
+    assert acronym_links("models trained with RFT") == [("RFT", 1)]
+    assert acronym_links("reinforcement learning from human feedback (RLHF)") == [
+        ("reinforcement learning from human feedback (RLHF)", 2)
+    ]
+
+
+def test_abbreviation_spelled_with_other_word_forms_keeps_its_link():
+    assert acronym_links("standard supervised finetuning (SFT); SFT is cheap") == [
+        ("SFT", 3),
+        ("SFT", 3),
+    ]
+    assert acronym_links("beats the Tiny Recursion Model (TRM) and TRM loops") == [
+        ("TRM", 4),
+        ("TRM", 4),
+    ]
+    assert acronym_links("a Visual Transformer (ViT) backbone") == [("ViT", 5)]
+
+
+def test_function_word_does_not_start_an_expansion():
+    assert acronym_links("aligned during optimization (DPO); DPO helps") == [
+        ("DPO", 6),
+        ("DPO", 6),
+    ]
+    # "Model" is ignored when comparing words but can still start the expansion.
+    assert acronym_links("a Model Predictive Controller (MPC); MPC runs") == [
+        ("MPC", 7),
+        ("MPC", 7),
+    ]
+    # A trailing "Model" alone does not make "Mamba Language Model" an MLM.
+    assert acronym_links("our Mamba Language Model (MLM); the MLM wins") == []
 
 
 def test_full_name_long_forms_and_bad_suffixes_do_not_match():
@@ -513,3 +570,12 @@ def test_versioned_names_also_match_with_a_v_prefix():
         ("SQuAD v1.1", "dataset", 97),
         ("SQuAD v2.0", "dataset", 98),
     ]
+
+
+def test_at_metrics_match_only_as_written():
+    assert links("mean pass@1 on AIME and higher Pass@k") == [
+        ("pass@1", "method", 128),
+        ("Pass@k", "method", 128),
+    ]
+    assert links("in pass 1 we pass@10 and email a@b.org") == []
+    assert links("GRPO@4 rollouts") == [("GRPO", "method", 4)]

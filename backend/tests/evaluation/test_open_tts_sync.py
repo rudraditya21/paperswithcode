@@ -11,35 +11,42 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
 
+from backend.database.datasets_setup import add_open_tts_leaderboard as setup
 from backend.models.database import (
     Base,
     Dataset,
     Evaluation,
+    HfArtifact,
     Metric,
+    ModelProviderAlias,
+    ModelRelease,
+    ModelReleaseArtifact,
+    ModelReleaseSignal,
     Paper,
+    PaperHfArtifact,
     PaperTask,
     Task,
     TaskDataset,
     TaskDatasetMetric,
 )
+from backend.services import open_tts_sync_service as tts
 from backend.services.artificial_analysis_sync_service import (
     ArtificialAnalysisDiscovery,
     PaperIdentity,
 )
-from backend.services import open_tts_sync_service as tts
-from backend.database.datasets_setup import add_open_tts_leaderboard as setup
-
 from backend.services.open_tts_sync_service import (
     DEFAULT_DATASETS,
     DEFAULT_LANGUAGE,
-    SPACE_APP_URL,
     MANAGED_METHODOLOGY_PREFIX,
+    SPACE_APP_URL,
     SPACE_SOURCE_URL,
     OpenTtsEntry,
     OpenTtsSyncService,
     fetch_open_tts_leaderboard,
     parse_open_tts_leaderboard,
 )
+from backend.tests.evaluation.model_evidence import add_release_evidence
+from backend.services.leaderboard_model_matching_service import MatchedModel
 
 
 @compiles(BigInteger, "sqlite")
@@ -141,10 +148,10 @@ def test_parse_and_fetch_default_public_leaderboard_contract():
             assert url == SPACE_APP_URL
             assert verbose is False
 
-        def predict(self, version, search, languages, datasets, clone, *, api_name):
+        def predict(self, *, version, search, langs, datasets, clone, api_name):
             assert version == "latest"
             assert search == ""
-            assert languages == [DEFAULT_LANGUAGE]
+            assert langs == [DEFAULT_LANGUAGE]
             assert datasets == DEFAULT_DATASETS
             assert clone is False
             assert api_name == "/partial"
@@ -218,7 +225,7 @@ def test_fetches_english_and_every_available_language_view():
             assert verbose is False
             self.calls = 0
 
-        def predict(self, version, search, languages, datasets, clone, *, api_name):
+        def predict(self, *, version, search, langs, datasets, clone, api_name):
             assert (version, search, datasets, clone, api_name) == (
                 "latest",
                 "",
@@ -228,9 +235,9 @@ def test_fetches_english_and_every_available_language_view():
             )
             self.calls += 1
             if self.calls == 1:
-                assert languages == [DEFAULT_LANGUAGE]
+                assert langs == [DEFAULT_LANGUAGE]
                 return _response(_payload(), language_choices=choices)
-            assert languages == all_languages
+            assert langs == all_languages
             return _response(
                 multilingual_payload,
                 language=all_languages,
@@ -264,10 +271,13 @@ def test_parser_rejects_truncated_or_noncontiguous_data():
 
 def test_parser_accepts_complete_ranked_subset_from_multilingual_view():
     payload = _payload()
-    for row in payload["data"][5:]:
+    for row in payload["data"][5:8]:
         row[0] = None
         row[2] = None
         row[3] = None
+    # Partial-coverage rows keep their averages but have no rank.
+    for row in payload["data"][8:]:
+        row[0] = None
 
     entries = parse_open_tts_leaderboard(payload, min_ranked_entries=5)
 
@@ -288,6 +298,12 @@ def _session() -> Session:
             TaskDatasetMetric.__table__,
             Evaluation.__table__,
             PaperTask.__table__,
+            HfArtifact.__table__,
+            PaperHfArtifact.__table__,
+            ModelRelease.__table__,
+            ModelReleaseArtifact.__table__,
+            ModelProviderAlias.__table__,
+            ModelReleaseSignal.__table__,
         ],
     )
     session = Session(engine)
@@ -401,7 +417,9 @@ def test_sync_is_idempotent_and_only_replaces_managed_rows(monkeypatch):
         "created": 1,
         "updated": 0,
         "deleted": 2,
+        "auto_matched": [],
         "excluded_models": ["org/unreviewed"],
+        "no_paper_models": [],
         "missing_papers": [],
     }
     assert (second.created, second.updated, second.deleted) == (0, 1, 0)
@@ -417,6 +435,141 @@ def test_sync_is_idempotent_and_only_replaces_managed_rows(monkeypatch):
     assert managed.evaluated_on.isoformat() == "2026-09-11"
     assert rows["Manual result"].best_rank == 1
     assert session.query(PaperTask).one().source == "auto"
+
+
+def test_unknown_models_match_announcements_or_become_radar_signals(monkeypatch):
+    session = _session()
+    monkeypatch.setattr(tts, "MODEL_PAPER_IDENTITIES", {})
+    session.add(
+        Paper(
+            id=10,
+            title="Introducing Echo TTS 2",
+            source="external",
+            source_url="https://example.com/echo-tts-2.pdf",
+            version="v1",
+            is_latest_version=True,
+        )
+    )
+    add_release_evidence(session, 10)
+    session.commit()
+    english = [
+        OpenTtsEntry("echo-lab/echo-tts-2", "Echo TTS 2", 1, 1.5, 20.0, True),
+        OpenTtsEntry("voice-lab/Voice-9", "Voice 9", 2, 2.5, 8.0, False),
+    ]
+    leaderboards = {
+        tts.DATASET_SLUG: english,
+        tts.ALL_LANGUAGE_DATASET_SLUG: english[:1],
+    }
+    discovery = ArtificialAnalysisDiscovery(papers={})
+    now = datetime(2026, 11, 9, 12, 0, tzinfo=UTC)
+
+    first = OpenTtsSyncService(session).sync_benchmarks(
+        leaderboards, discovery=discovery, fetched_at=now
+    )
+    second = OpenTtsSyncService(session).sync_benchmarks(
+        leaderboards, discovery=discovery, fetched_at=now
+    )
+
+    for stats in (*first.values(), *second.values()):
+        assert stats.auto_matched == ["echo-lab/echo-tts-2"]
+    assert first[tts.DATASET_SLUG].excluded_models == ["voice-lab/Voice-9"]
+    assert first[tts.DATASET_SLUG].created == second[tts.DATASET_SLUG].updated == 1
+    rows = session.query(Evaluation).filter(Evaluation.paper_id == 10).all()
+    assert sorted(row.dataset_id for row in rows) == [2_400, 2_401]
+    assert {row.model_name for row in rows} == {"Echo TTS 2"}
+    assert {row.hf_model_url for row in rows} == {
+        "https://huggingface.co/echo-lab/echo-tts-2"
+    }
+    assert session.query(PaperTask).filter(PaperTask.paper_id == 10).count() == 1
+    # One signal per sync run, whichever views list the model.
+    signal = session.query(ModelReleaseSignal).one()
+    assert (signal.lab, signal.model_name) == ("voice-lab", "Voice 9")
+    assert signal.sightings == 2
+
+
+def test_models_without_a_paper_stay_off_the_board(monkeypatch):
+    session = _session()
+    monkeypatch.setattr(tts, "MODEL_PAPER_IDENTITIES", {})
+    papers = {
+        10: ("Ming-3.0-tts", "https://github.com/inclusionAI/Ming-3.0-tts"),
+        11: ("Introducing Echo TTS 2", "https://example.com/blog/echo-tts-2"),
+        12: ("Wave 3 Technical Report", "https://example.com/wave-3"),
+    }
+    for paper_id, (title, source_url) in papers.items():
+        session.add(
+            Paper(
+                id=paper_id,
+                title=title,
+                source="external",
+                source_url=source_url,
+                version="v1",
+                is_latest_version=True,
+            )
+        )
+        add_release_evidence(session, paper_id)
+    session.commit()
+    english = [
+        OpenTtsEntry(
+            "inclusionAI/Ming-3.0-tts-0.5B",
+            "inclusionAI/Ming-3.0-tts-0.5B",
+            1,
+            1.0,
+            20.0,
+            True,
+        ),
+        OpenTtsEntry("echo-lab/echo-tts-2", "Echo TTS 2", 2, 1.5, 20.0, True),
+        OpenTtsEntry("wave-lab/Wave-3", "wave-lab/Wave-3", 3, 2.0, 20.0, True),
+    ]
+    matched = {
+        "inclusionAI/Ming-3.0-tts-0.5B": MatchedModel(
+            10, "inclusionAI/Ming-3.0-tts-0.5B", True
+        ),
+        "Echo TTS 2": MatchedModel(11, "Echo TTS 2", True),
+        "wave-lab/Wave-3": MatchedModel(12, "wave-lab/Wave-3", True),
+    }
+    monkeypatch.setattr(
+        tts.LeaderboardModelMatcher, "match", lambda _self, _models: matched
+    )
+
+    stats = OpenTtsSyncService(session).sync(
+        english,
+        discovery=ArtificialAnalysisDiscovery(papers={}),
+        fetched_at=datetime(2026, 11, 12, tzinfo=UTC),
+    )
+
+    assert stats.no_paper_models == [
+        "inclusionAI/Ming-3.0-tts-0.5B",
+        "echo-lab/echo-tts-2",
+    ]
+    row = session.query(Evaluation).one()
+    assert (row.paper_id, row.model_name) == (12, "Wave-3")
+    assert session.query(PaperTask).one().paper_id == 12
+
+
+def test_has_paper_and_display_model_name():
+    assert tts.has_paper(Paper(source="arxiv", arxiv_id="2601.00001"))
+    assert tts.has_paper(
+        Paper(source="external", source_url="https://x.org/report.pdf?dl=1")
+    )
+    assert tts.has_paper(
+        Paper(
+            source="external",
+            title="Inflect v2",
+            source_url="https://github.com/o/i/blob/main/docs/TECHNICAL_REPORT.md",
+        )
+    )
+    assert not tts.has_paper(
+        Paper(
+            source="external",
+            title="Kokoro-82M",
+            source_url="https://huggingface.co/hexgrad/Kokoro-82M",
+        )
+    )
+    assert (
+        tts.display_model_name("inclusionAI/Ming-3.0-tts-0.5B") == "Ming-3.0-tts-0.5B"
+    )
+    assert tts.display_model_name("org/model-3 (variant)") == "model-3 (variant)"
+    assert tts.display_model_name("Echo TTS 2") == "Echo TTS 2"
 
 
 def test_sync_rolls_back_dry_run(monkeypatch):
@@ -663,3 +816,22 @@ def test_cron_syncs_both_open_tts_views(monkeypatch):
         tts.DATASET_SLUG,
         tts.ALL_LANGUAGE_DATASET_SLUG,
     }
+
+
+def test_parser_keeps_the_best_rank_of_a_model_listed_twice():
+    payload = _payload()
+    # Upstream lists one repository under two voices.
+    payload["data"][9][1] = payload["data"][4][1].replace("model-5 (variant)", "Mira")
+
+    entries = parse_open_tts_leaderboard(payload)
+
+    assert len(entries) == 14
+    assert [e.rank for e in entries if e.model_id == "org/model-5"] == [5]
+
+    payload["data"][9][0] = 5
+    try:
+        parse_open_tts_leaderboard(payload)
+    except ValueError as exc:
+        assert "duplicate ranks" in str(exc)
+    else:
+        raise AssertionError("duplicate rank was accepted")

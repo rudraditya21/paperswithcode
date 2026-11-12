@@ -27,8 +27,8 @@ def test_registry_covers_workflows_systemd_and_allowlist_exactly():
     summary = _dashboard_job_summary(
         [{"category": job.category, "status": "healthy"} for job in jobs]
     )
-    assert summary["total_jobs"] == 65
-    assert summary["scheduled_jobs"] == 64
+    assert summary["total_jobs"] == 76
+    assert summary["scheduled_jobs"] == 75
     assert summary["manual_jobs"] == 1
     assert len(by_id) == len(jobs), "duplicate dashboard job IDs"
 
@@ -84,6 +84,7 @@ def test_registry_covers_workflows_systemd_and_allowlist_exactly():
         "alert_submission_review_failure",
         "extract_urls_select",
         "extract_urls_persist",
+        "x_post_candidates",
     }
     manual = {"extract_urls"}
     registered = set(by_id)
@@ -109,8 +110,6 @@ def test_registry_includes_hf_artifacts_embeddings_and_method_backfills():
     assert "sync_open_asr" in job_ids
     assert "sync_open_tts" in job_ids
     assert "sync_mmteb_overall" in job_ids
-    assert "sync_mmteb_retrieval" in job_ids
-    assert "sync_mmteb_reranking" in job_ids
     assert "sync_mmeb_v2" in job_ids
     assert "sync_mmeb_v3" in job_ids
     assert "sync_deepswe" in job_ids
@@ -122,7 +121,21 @@ def test_registry_includes_hf_artifacts_embeddings_and_method_backfills():
     assert "sync_physics_iq_verified" in job_ids
     assert "sync_vals_finance_agent" in job_ids
     assert "sync_surge_chartography" in job_ids
+    assert "sync_swe_marathon" in job_ids
+    assert "sync_jevbench" in job_ids
     assert "sync_frontiercs_2" in job_ids
+    assert "sync_vals_index" in job_ids
+    assert "sync_swe_sweep" in job_ids
+    assert "sync_vending_bench_2" in job_ids
+    assert "sync_blueprint_bench_2" in job_ids
+    assert "sync_riemann_bench" in job_ids
+    assert "sync_cwe_bench" in job_ids
+    assert "sync_exploitgym" in job_ids
+    assert "sync_cybergym" in job_ids
+    assert "sync_patcheval_verified" in job_ids
+    assert "sync_critpt" in job_ids
+    assert "sync_critpt_v2" in job_ids
+    assert "sync_terminal_bench_science" in job_ids
     assert "sync_coarena" in job_ids
     assert "sync_arc_prize" in job_ids
     assert "calculate_organization_trending_scores" in job_ids
@@ -134,6 +147,9 @@ def test_registry_includes_hf_artifacts_embeddings_and_method_backfills():
         "Sync Artificial Analysis Leaderboards"
     )
     assert "artificial-analysis-provider-voice-tts-arena" in (
+        artificial_analysis_job.db_freshness_query
+    )
+    assert "artificial-analysis-decision-index" in (
         artificial_analysis_job.db_freshness_query
     )
     assert "missing_fresh_datasets" in artificial_analysis_job.db_freshness_query
@@ -169,8 +185,6 @@ def test_registry_classifies_only_recurring_leaderboard_syncs():
         "sync_open_asr",
         "sync_open_tts",
         "sync_mmteb_overall",
-        "sync_mmteb_retrieval",
-        "sync_mmteb_reranking",
         "sync_mmeb_v2",
         "sync_mmeb_v3",
         "sync_deepswe",
@@ -182,7 +196,21 @@ def test_registry_classifies_only_recurring_leaderboard_syncs():
         "sync_physics_iq_verified",
         "sync_vals_finance_agent",
         "sync_surge_chartography",
+        "sync_swe_marathon",
+        "sync_jevbench",
         "sync_frontiercs_2",
+        "sync_vals_index",
+        "sync_swe_sweep",
+        "sync_vending_bench_2",
+        "sync_blueprint_bench_2",
+        "sync_riemann_bench",
+        "sync_cwe_bench",
+        "sync_exploitgym",
+        "sync_cybergym",
+        "sync_patcheval_verified",
+        "sync_critpt",
+        "sync_critpt_v2",
+        "sync_terminal_bench_science",
         "sync_coarena",
         "sync_arc_prize",
     }

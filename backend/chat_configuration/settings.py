@@ -108,7 +108,7 @@ class ChatModelSettings(BaseModel):
 class ChatOpenAIBudgetSettings(BaseModel):
     """Direct-OpenAI pricing, allowances, and rate limits."""
 
-    chat_openai_pricing_verified_at: str = Field(default="2026-10-19")
+    chat_openai_pricing_verified_at: str = Field(default="2026-11-12")
     chat_openai_pricing_max_age_days: int = Field(default=30, ge=1, le=90)
     chat_openai_input_microusd_per_million_tokens: int = Field(default=100_000, ge=1)
     chat_openai_cached_input_microusd_per_million_tokens: int = Field(
@@ -228,7 +228,7 @@ class ChatScopeGuardrailSettings(BaseModel):
     )
     chat_scope_guardrail_openai_api_key: str = Field(default="")
     chat_scope_guardrail_openai_model: str = Field(
-        default="gpt-5.6-luna", pattern=r"^gpt-5\.6-luna$"
+        default="gpt-6-luna", pattern=r"^gpt-6-luna$"
     )
     chat_scope_guardrail_attempt_timeout_seconds: float = Field(
         default=1.5, ge=0.1, le=1.5

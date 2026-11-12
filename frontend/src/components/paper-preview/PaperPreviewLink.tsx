@@ -10,14 +10,13 @@ import {
 import {
   PaperPreviewCard,
 } from "@/components/paper-preview/PaperPreviewCard";
-import { paperPreviewQueryKey } from "@/components/paper-preview/paperPreviewCache";
+import { paperQueries } from "@/lib/api/queries";
 import { ARXIV_ROUTE_ID, PaperIndexRequest } from "@/components/paper-preview/PaperIndexRequest";
 import {
   paperToPreviewData,
   type PaperPreviewData,
 } from "@/components/paper-preview/paperPreviewData";
-import { papersApi } from "@/lib/api/papers";
-import { ApiError } from "@/lib/apiTransport";
+import { isNotFound } from "@/lib/apiTransport";
 import { normalizePaperRouteId } from "@/lib/utils";
 
 interface PaperPreviewLinkProps {
@@ -56,10 +55,8 @@ export const PaperPreviewLink: React.FC<PaperPreviewLinkProps> = ({
   const [open, setOpen] = React.useState(false);
   const hasInitialData = Boolean(initialData?.title.trim());
   const query = useQuery({
-    queryKey: paperPreviewQueryKey(normalizedRouteId),
-    queryFn: () => papersApi.get(normalizedRouteId, false),
+    ...paperQueries.summary(normalizedRouteId),
     enabled: open && !hasInitialData,
-    staleTime: 5 * 60 * 1000,
     gcTime: 30 * 60 * 1000,
     retry: false,
   });
@@ -68,10 +65,7 @@ export const PaperPreviewLink: React.FC<PaperPreviewLinkProps> = ({
     (query.data
       ? paperToPreviewData(query.data, normalizedRouteId)
       : undefined);
-  const notIndexed =
-    query.error instanceof ApiError &&
-    query.error.status === 404 &&
-    ARXIV_ROUTE_ID.test(normalizedRouteId);
+  const notIndexed = isNotFound(query.error) && ARXIV_ROUTE_ID.test(normalizedRouteId);
 
   const link = (
     <Link

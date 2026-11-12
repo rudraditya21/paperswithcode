@@ -1,4 +1,3 @@
-import { getStoredAdminToken } from "./adminAuth";
 
 const LOG_API_REQUESTS = import.meta.env.DEV;
 
@@ -60,6 +59,10 @@ export class ApiError extends Error {
   }
 }
 
+/** True when a request failed because the resource does not exist. */
+export const isNotFound = (error: unknown): boolean =>
+  error instanceof ApiError && error.status === 404;
+
 /** User-facing failure text, with an operation-specific fallback for unknown errors. */
 export function getApiErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiError) return error.displayMessage || fallback;
@@ -85,13 +88,9 @@ export class ApiTransport {
       const { headers, ...requestOptions } = options ?? {};
       const method = (requestOptions.method ?? "GET").toUpperCase();
       const defaultCache: RequestCache = method === "GET" ? "default" : "no-store";
-      const adminToken = getStoredAdminToken();
       const requestHeaders = new Headers(headers);
-      if (!requestHeaders.has("Content-Type")) {
+      if (typeof requestOptions.body === "string" && !requestHeaders.has("Content-Type")) {
         requestHeaders.set("Content-Type", "application/json");
-      }
-      if (adminToken && !requestHeaders.has("X-Admin-Token")) {
-        requestHeaders.set("X-Admin-Token", adminToken);
       }
       const response = await fetch(url, {
         ...requestOptions,
@@ -110,26 +109,23 @@ export class ApiTransport {
     }
   }
 
-  async request<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  /** Like `fetch`, but rejects non-2xx responses with an `ApiError`. */
+  async fetchOk(endpoint: string, options?: RequestInit): Promise<Response> {
     const response = await this.fetch(endpoint, options);
     if (!response.ok) {
       const error = new ApiError(response, await response.text());
       console.error("[API] Error response:", error.response);
       throw error;
     }
+    return response;
+  }
+
+  async request<T>(endpoint: string, options?: RequestInit): Promise<T> {
+    const response = await this.fetchOk(endpoint, options);
     if (response.status === 204) return undefined as T;
 
     const data = await response.json();
     if (LOG_API_REQUESTS) console.log("[API] Success:", data);
     return data;
   }
-}
-
-/** Compatibility helper for callers that have not moved to a domain client yet. */
-export function requestJson<T>(
-  baseUrl: string,
-  endpoint: string,
-  options?: RequestInit,
-): Promise<T> {
-  return new ApiTransport(baseUrl).request<T>(endpoint, options);
 }

@@ -120,10 +120,16 @@ def _leaderboard_inventory(db: Session, query: str) -> list[dict]:
     return _service(db).leaderboard_inventory(query)
 
 
+# Frontier LLM model cards list 40+ benchmarks, and the skill asks for each
+# name plus common variants, so leaderboard lookups need a larger budget than
+# taxonomy searches. Paper 131976 (Ripple-65B) ran out at 30 and got no evals.
+QUERY_LIMITS = {"taxonomy_query_count": 30, "leaderboard_query_count": 150}
+
+
 def _consume_query(db: Session, row: PaperCurationJob, field: str) -> None:
     db.refresh(row, with_for_update=True)
     value = getattr(row, field)
-    if value >= 30:
+    if value >= QUERY_LIMITS[field]:
         db.rollback()
         raise HTTPException(status_code=429, detail="Scoped query limit reached")
     setattr(row, field, value + 1)
@@ -211,6 +217,9 @@ def retry_job(
     row = db.get(PaperCurationJob, job_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    if getattr(row, "runner", "codex") == "pi":
+        # Pairs are best effort: a failed Pi run is itself a comparison result.
+        raise HTTPException(status_code=409, detail="Pi shadow jobs are not retried")
     return codex_paper_job_service.retry(db, row, settings)
 
 
@@ -375,19 +384,25 @@ def apply_mutation(
     row = _callback_job(job_id, authorization, db)
     try:
         service = _service(db)
+        # Pi shadow jobs never write, so they need no autonomous run context.
+        pi_shadow = getattr(row, "runner", "codex") == "pi"
         context = (
             _autonomous_callback_context(db, row)
-            if getattr(row, "trigger", "admin") != "admin"
+            if getattr(row, "trigger", "admin") != "admin" and not pi_shadow
             else None
         )
         if context is not None and not settings.codex_curation_direct_apply_enabled:
             service.authorize_autonomous_callback(row, body, context=context)
-        if (
+        if pi_shadow or (
             getattr(row, "trigger", "admin") != "admin"
             and not settings.codex_curation_direct_apply_enabled
         ):
             service._validate_mutation(row, body)
-            validation = service._validate_scheduled_policy(row, body)
+            validation = service._validate_scheduled_policy(
+                row,
+                service.shadow_validation_body(row, body),
+                preapply_body=body,
+            )
             row.proposal = body.model_dump(mode="json")
             row.validation_summary = {**validation, "mode": "shadow"}
             row.mutation_result = {
@@ -425,6 +440,47 @@ def apply_mutation(
         raise
 
 
+TRACE_FAILURE_STATUSES = frozenset({"preapply_failed", "finalize_failed"})
+
+
+def _record_trace_failure(
+    db: Session, row: PaperCurationJob, trace_status: str, error: Exception
+) -> None:
+    """Record a failed trace upload; trip the breaker on three failing jobs.
+
+    A runner retries a failed upload several times. Only the first failure of
+    a job counts, so one job's retries cannot pause the whole scheduled lane.
+    A successful upload resets the counter and the job's failed status.
+    """
+    logger.warning(
+        "curation trace upload failed job=%s stage=%s attempt=%s error=%s: %s",
+        row.id,
+        trace_status,
+        row.trace_attempt_count + 1,
+        type(error).__name__,
+        str(error)[:1_000],
+    )
+    first_failure = row.trace_status not in TRACE_FAILURE_STATUSES
+    row.trace_status = trace_status
+    row.trace_attempt_count += 1
+    state = db.get(PaperCurationSchedulerState, 1)
+    if (
+        first_failure
+        and state
+        and row.trigger != "admin"
+        and getattr(row, "runner", "codex") == "codex"
+    ):
+        state.consecutive_trace_failures += 1
+        if state.consecutive_trace_failures >= 3:
+            state.paused_at = datetime.now(UTC)
+            state.pause_condition = "trace_upload_failures"
+            state.pause_reason = "Three consecutive scheduled jobs failed trace uploads"
+            logger.error(
+                "paper curation dispatch paused condition=trace_upload_failures"
+            )
+    db.commit()
+
+
 @router.post("/{job_id}/trace/preapply")
 def store_preapply_trace(
     job_id: uuid.UUID,
@@ -448,19 +504,7 @@ def store_preapply_trace(
             url_candidates=body.url_candidates,
         )
     except (ValueError, RuntimeError, HfHubHTTPError, OSError) as error:
-        row.trace_status = "preapply_failed"
-        row.trace_attempt_count += 1
-        state = db.get(PaperCurationSchedulerState, 1)
-        if state and row.trigger != "admin":
-            state.consecutive_trace_failures += 1
-            if state.consecutive_trace_failures >= 3:
-                state.paused_at = datetime.now(UTC)
-                state.pause_condition = "trace_upload_failures"
-                state.pause_reason = "Three consecutive scheduled trace uploads failed"
-                logger.error(
-                    "paper curation dispatch paused condition=trace_upload_failures"
-                )
-        db.commit()
+        _record_trace_failure(db, row, "preapply_failed", error)
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
@@ -477,19 +521,7 @@ def finalize_trace(
     try:
         return CurationTraceService(db, settings).finalize(row, body.model_dump())
     except (ValueError, RuntimeError, HfHubHTTPError, OSError) as error:
-        row.trace_status = "finalize_failed"
-        row.trace_attempt_count += 1
-        state = db.get(PaperCurationSchedulerState, 1)
-        if state and row.trigger != "admin":
-            state.consecutive_trace_failures += 1
-            if state.consecutive_trace_failures >= 3:
-                state.paused_at = datetime.now(UTC)
-                state.pause_condition = "trace_upload_failures"
-                state.pause_reason = "Three consecutive scheduled trace uploads failed"
-                logger.error(
-                    "paper curation dispatch paused condition=trace_upload_failures"
-                )
-        db.commit()
+        _record_trace_failure(db, row, "finalize_failed", error)
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 

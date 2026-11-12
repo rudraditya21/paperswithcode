@@ -88,10 +88,36 @@ beforeEach(() => {
   listPendingPaperEdits.mockResolvedValue({
     count: 1,
     results: [externalPaperSubmission],
+    status_counts: { pending: 1, approved: 0, rejected: 0 },
   });
 });
 
 describe("SubmissionsDashboard", () => {
+  it("pages all statuses with one request per page and reads counts once", async () => {
+    const rows = Array.from({ length: 60 }, (_, index) => ({
+      ...externalPaperSubmission,
+      id: index + 1,
+      status: index % 2 ? "approved" : "pending",
+    }));
+    const status_counts = { pending: 30, approved: 30, rejected: 0 };
+    listPendingPaperEdits.mockImplementation(async ({ limit, offset = 0 }: { limit: number; offset?: number }) => ({
+      count: rows.length,
+      results: rows.slice(offset, offset + limit),
+      status_counts,
+    }));
+
+    renderDashboard();
+    const [allStatuses] = await screen.findAllByRole("button", { name: /^all/ });
+    await userEvent.click(allStatuses);
+    expect(await screen.findByText("Showing 25 of 60 submissions")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect(await screen.findByText("Showing 50 of 60 submissions")).toBeInTheDocument();
+
+    const calls = listPendingPaperEdits.mock.calls.map(([params]) => params);
+    expect(calls.filter((params) => params.limit === 1)).toEqual([{ status: "all", limit: 1 }]);
+    expect(calls.filter((params) => params.status === "all" && params.limit === 25).map((params) => params.offset)).toEqual([0, 25]);
+  });
+
   it("shows a controlled error when pending-edit data is malformed", async () => {
     listPendingPaperEdits.mockRejectedValue(
       new Error("Malformed pending-edit payload: proposed_payload.task_ids: Required"),
@@ -224,15 +250,15 @@ it.each(["tasks", "organizations"] as const)("invalidates route details and feed
   const paper = { id: "42", arxiv_id: "2401.00001", title: "Cached paper" };
   client.setQueryData(["paper-summary", "42"], paper);
   client.setQueryData(["paper", paper.arxiv_id], paper);
-  client.setQueryData(["paper-preview", paper.arxiv_id], paper);
+  client.setQueryData(["paper-summary", paper.arxiv_id], paper);
   client.setQueryData(["organization-papers-infinite", "nvidia"], [paper]);
-  const submission = { ...externalPaperSubmission, paper_id: 42, edit_type, proposed_payload: edit_type === "tasks" ? { task_ids: [1] } : { organization_ids: [1] } };
+  const submission = { ...externalPaperSubmission, paper_id: 42, paper, edit_type, proposed_payload: edit_type === "tasks" ? { task_ids: [1] } : { organization_ids: [1] } };
   listPendingPaperEdits.mockResolvedValue({ count: 1, results: [submission] });
   approve.mockResolvedValue({ ...submission, status: "approved" });
   renderDashboard(client);
   await userEvent.setup().click(await screen.findByRole("button", { name: "Approve" }));
   await waitFor(() => expect(client.getQueryState(["paper", paper.arxiv_id])?.isInvalidated).toBe(true));
-  expect(client.getQueryState(["paper-preview", paper.arxiv_id])?.isInvalidated).toBe(true);
+  expect(client.getQueryState(["paper-summary", paper.arxiv_id])?.isInvalidated).toBe(true);
   expect(client.getQueryState(["organization-papers-infinite", "nvidia"])?.isInvalidated).toBe(true);
 });
 

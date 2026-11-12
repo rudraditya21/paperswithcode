@@ -10,7 +10,6 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
-from huggingface_hub import HfFileSystem
 from huggingface_hub.errors import HfHubHTTPError
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -23,6 +22,10 @@ from backend.models.database import (
     PaperCurationSchedulerState,
     PaperCurationWorkflow,
 )
+from backend.scripts.generate_missing_paper_markdown import (
+    validate_canonical_markdown,
+)
+from backend.services.benchmark_gap_service import BenchmarkGapService
 from backend.services.codex_add_evals_service import (
     EXTERNAL_PAPER_POLICY_VERSION,
     CodexPaperJobService,
@@ -30,18 +33,19 @@ from backend.services.codex_add_evals_service import (
     deferred_workflows_for_release,
     operator_retryable,
 )
-from backend.services.curation_priority_service import (
-    has_pending_daily_papers,
-    pending_daily_papers,
-)
-from backend.services.benchmark_gap_service import BenchmarkGapService
 from backend.services.codex_curation_callback_service import (
     CodexCurationCallbackService,
 )
-from backend.scripts.generate_missing_paper_markdown import (
-    validate_canonical_markdown,
+from backend.services.curation_priority_service import (
+    DAILY_PRIORITY,
+    X_TRENDING_PRIORITY,
+    has_pending_daily_papers,
+    is_priority_paper,
+    pending_daily_papers,
+    pending_x_trending_papers,
 )
 from backend.services.external_page_markdown_service import web_markdown_pending
+from backend.services.hf_bucket_filesystem import BucketFileSystem
 from backend.utils.hf_daily_papers import fetch_hf_daily_papers
 from backend.utils.urls import get_paper_route_identifier
 from jobs.curation_failure_codes import AWAITING_MARKDOWN
@@ -95,7 +99,7 @@ def paper_markdown_available(paper: Paper, settings: Settings) -> bool:
     key = f"{arxiv_id[:4]}/{arxiv_id}.md"
     path = f"hf://buckets/{settings.paper_markdown_hf_bucket_id}/{key}"
     try:
-        filesystem = HfFileSystem(token=settings.hf_token)
+        filesystem = BucketFileSystem(token=settings.hf_token)
         with filesystem.open(path, "rb", block_size=0) as handle:
             raw = handle.read(64 * 1024 * 1024 + 1)
         if len(raw) > 64 * 1024 * 1024:
@@ -169,7 +173,7 @@ class HFDailyCurationService:
         if daily_only:
             query = query.join(
                 Paper, Paper.id == PaperCurationWorkflow.paper_id
-            ).filter(Paper.hf_daily_featured_on.isnot(None))
+            ).filter(is_priority_paper())
         workflows = (
             query.order_by(
                 PaperCurationWorkflow.updated_at,
@@ -397,7 +401,9 @@ class HFDailyCurationService:
         oldest = (
             self.db.query(func.min(PaperCurationJob.created_at))
             .filter(
-                PaperCurationJob.trigger != "admin", PaperCurationJob.status == "queued"
+                PaperCurationJob.trigger != "admin",
+                PaperCurationJob.runner == "codex",
+                PaperCurationJob.status == "queued",
             )
             .scalar()
         )
@@ -430,6 +436,35 @@ class HFDailyCurationService:
                 "queue_depth": self.settings.codex_curation_queue_depth,
                 "canary_limit": self.settings.codex_curation_canary_limit,
             },
+            "pi_shadow": self._pi_shadow_status(),
+        }
+
+    def _pi_shadow_status(self) -> dict:
+        """Pi shadow outcomes of the last week; they feed no breaker or pause."""
+        since = datetime.now(UTC) - timedelta(days=7)
+
+        def count(*criteria) -> int:
+            return (
+                self.db.query(func.count(PaperCurationJob.id))
+                .filter(
+                    PaperCurationJob.runner == "pi",
+                    PaperCurationJob.created_at >= since,
+                    *criteria,
+                )
+                .scalar()
+                or 0
+            )
+
+        return {
+            "sample_rate": self.settings.curation_pi_shadow_sample_rate,
+            "max_active": self.settings.curation_pi_shadow_max_active,
+            "image": self.settings.curation_pi_jobs_image,
+            "model": self.settings.curation_pi_model,
+            "provider": self.settings.curation_pi_provider,
+            "token_configured": bool(self.settings.curation_pi_hf_token),
+            "completed_last_7_days": count(PaperCurationJob.status == "completed"),
+            "failed_last_7_days": count(PaperCurationJob.status == "failed"),
+            "pairs_compared_last_7_days": count(PaperCurationJob.pair_diff.isnot(None)),
         }
 
     def _enqueue_workflow(
@@ -552,6 +587,18 @@ class HFDailyCurationService:
                     paper.hf_daily_featured_on or cohort_date, cohort_date
                 )
         self.db.flush()
+        # Papers trending on X are admitted ahead of the HF daily cohort.
+        x_trending = [
+            (shared_on, order, paper.arxiv_id)
+            for order, (paper, shared_on) in enumerate(
+                pending_x_trending_papers(self.db)
+            )
+        ]
+        x_trending_ids = {arxiv_id for _, _, arxiv_id in x_trending}
+        discovered = x_trending + [
+            entry for entry in discovered if entry[2] not in x_trending_ids
+        ]
+        seen |= x_trending_ids
         for paper in pending_daily_papers(self.db).order_by(
             Paper.hf_daily_featured_on.desc(), Paper.id
         ):
@@ -578,7 +625,7 @@ class HFDailyCurationService:
                 .filter(
                     PaperCurationWorkflow.status == "queued",
                     PaperCurationWorkflow.source_candidate_id.is_(None),
-                    Paper.hf_daily_featured_on.is_(None),
+                    ~is_priority_paper(),
                     ~active_job,
                 )
             ):
@@ -651,6 +698,9 @@ class HFDailyCurationService:
         admission_capacity = min(capacity, reconcile_limit)
 
         for cohort_date, order, arxiv_id in discovered:
+            priority = (
+                X_TRENDING_PRIORITY if arxiv_id in x_trending_ids else DAILY_PRIORITY
+            )
             paper = (
                 self.db.query(Paper)
                 .filter(Paper.arxiv_id == arxiv_id, Paper.is_latest_version)
@@ -682,14 +732,14 @@ class HFDailyCurationService:
                         )
                         .all()
                     ):
-                        job.priority = 10
+                        job.priority = min(job.priority, priority)
                         job.cohort_date = cohort_date
                     if (
                         existing.status == "deferred"
                         and existing.deferred_reason in {"queue_cap", "canary_cap"}
                         and create_capacity > 0
                     ):
-                        self._enqueue_workflow(existing, paper, priority=10)
+                        self._enqueue_workflow(existing, paper, priority=priority)
                         create_capacity -= 1
                         admission_capacity -= 1
                         summary["released_deferred"] += 1
@@ -749,7 +799,7 @@ class HFDailyCurationService:
             self.db.add(workflow)
             self.db.flush()
             if workflow.status == "queued":
-                self._enqueue_workflow(workflow, paper, priority=10)
+                self._enqueue_workflow(workflow, paper, priority=priority)
 
         # Resume source-ready historical work too; blocked daily papers must
         # not prevent it from using capacity left after daily admission. Existing

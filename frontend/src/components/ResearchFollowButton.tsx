@@ -1,11 +1,10 @@
 import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useLocation } from 'react-router-dom';
 import { Check, Plus } from 'lucide-react';
-import { researchApi, type FollowKind } from '@/lib/api/research';
-import { isAuthDisabled } from '@/lib/apiUrl';
+import type { FollowKind } from '@/lib/api/research';
+import { hfLoginUrl, isAuthDisabled } from '@/lib/apiUrl';
 import { useOptionalAuth } from '@/lib/authContext';
-import { hfLoginUrl } from './HfSignInButton';
+import { useResearchFollows, useSetFollow } from '@/lib/researchTopic';
 
 const HINTS: Record<FollowKind, string> = {
   task: 'Get new papers on this task',
@@ -19,21 +18,13 @@ export default function ResearchFollowButton({ kind, entityId }: { kind: FollowK
   const auth = useOptionalAuth();
   const user = auth?.user;
   const location = useLocation();
-  const client = useQueryClient();
   // Keyed by entity so a reused instance never confirms a follow on another page.
   const [justFollowed, setJustFollowed] = useState<string | null>(null);
   const entityKey = `${kind}:${entityId}`;
-  const queryKey = ['research-follows', user?.hf_subject];
-  const follows = useQuery({ queryKey, queryFn: researchApi.follows, enabled: !!user });
+  const follows = useResearchFollows();
   const followed = follows.data?.some(f => f.kind === kind && String(f.entity_id) === String(entityId)) ?? false;
-  const mutation = useMutation({
-    mutationFn: () => researchApi.setFollow(kind, entityId, !followed),
-    onSuccess: async () => {
-      setJustFollowed(followed ? null : entityKey);
-      await client.invalidateQueries({ queryKey });
-      await client.invalidateQueries({ queryKey: ['research-feed', user?.hf_subject] });
-    },
-  });
+  // Stay disabled until the refreshed follows say which way the button points.
+  const mutation = useSetFollow({ onChanged: ({ follow }) => setJustFollowed(follow ? entityKey : null), awaitRefresh: true });
   if (!auth) return null;
   if (!user && isAuthDisabled()) return null;
   if (!user) return <div className="research-follow">
@@ -46,7 +37,7 @@ export default function ResearchFollowButton({ kind, entityId }: { kind: FollowK
   return <div className="research-follow">
     <button type="button" className={followed ? 'research-follow-btn is-following' : 'research-follow-btn'}
       disabled={follows.isLoading || !!follows.error || mutation.isPending}
-      aria-pressed={followed} aria-label={followed ? 'Unfollow' : 'Follow'} onClick={() => mutation.mutate()}>
+      aria-pressed={followed} aria-label={followed ? 'Unfollow' : 'Follow'} onClick={() => mutation.mutate({ kind, entityId, follow: !followed })}>
       {followed ? <>
         <Check aria-hidden="true" />
         <span className="research-follow-label">Following</span>
@@ -56,7 +47,7 @@ export default function ResearchFollowButton({ kind, entityId }: { kind: FollowK
     {failed ? <span className="research-follow-hint is-error" role="alert">Could not update follows. Please try again.</span>
       : followed ? justFollowed === entityKey && <span className="research-follow-hint" role="status">
         Added to <Link to="/following">your Following feed</Link>
-        {' · '}<Link to="/settings">Manage in Settings</Link>
+        {' · '}<Link to="/following?edit=1">Edit feed</Link>
       </span>
       : <span className="research-follow-hint">{HINTS[kind]} in <Link to="/following">your Following feed</Link>.</span>}
   </div>;

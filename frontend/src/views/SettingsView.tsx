@@ -10,6 +10,7 @@ import React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ExternalLink, Monitor, Moon, Sun } from "lucide-react";
 import { useTheme } from "next-themes";
+import { useLocation } from "react-router-dom";
 
 import HfSignInButton from "@/components/HfSignInButton";
 import ResearchSettings from "@/components/ResearchSettings";
@@ -18,14 +19,15 @@ import { chatApi } from "@/lib/api/chat";
 import { ApiError } from "@/lib/apiTransport";
 import { isChatEnabled } from "@/lib/apiUrl";
 import { useAuth } from "@/lib/authContext";
-import { DEFAULT_SITE_SUFFIX, formatPageTitle } from "@/lib/latexPlainText";
+import { formatPageTitle } from "@/lib/latexPlainText";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import {
   OPENROUTER_CREDENTIAL_QUERY_KEY,
   resetTimeLabels,
   useOpenRouterCredential,
   useOpenRouterUsage,
 } from "@/lib/openrouter";
-import { usePreferences } from "@/lib/preferencesContext";
+import { usePreferences } from "@/lib/preferences";
 
 const OPENROUTER_KEY_SETTINGS_URL = "https://openrouter.ai/settings/keys";
 
@@ -53,6 +55,9 @@ const SettingsView: React.FC = () => {
     isLoading: preferencesLoading,
   } = usePreferences();
   const { theme, setTheme } = useTheme();
+  const location = useLocation();
+  const closedSourceRow = React.useRef<HTMLDivElement>(null);
+  const highlightClosedSource = location.hash === "#closed-source-evals";
   const selectedTheme = theme ?? "system";
   const chatEnabled = isChatEnabled();
   const [billingError, setBillingError] = React.useState("");
@@ -96,6 +101,12 @@ const SettingsView: React.FC = () => {
   const initialSettingsLoading = (
     authLoading || preferencesLoading || theme === undefined || providerDataLoading
   );
+  // The toggle mounts only after the initial loading state, so wait for it.
+  React.useEffect(() => {
+    if (!highlightClosedSource || initialSettingsLoading) return;
+    closedSourceRow.current?.scrollIntoView({ block: "center" });
+    closedSourceRow.current?.querySelector<HTMLElement>("#hide-closed-source-evals")?.focus();
+  }, [highlightClosedSource, initialSettingsLoading]);
   const selectBillingAccountMutation = useMutation({
     mutationFn: (billTo: string | null) => (
       chatApi.selectInferenceBillingAccount(billTo)
@@ -156,12 +167,7 @@ const SettingsView: React.FC = () => {
     ),
   });
 
-  React.useEffect(() => {
-    document.title = formatPageTitle("Settings");
-    return () => {
-      document.title = DEFAULT_SITE_SUFFIX;
-    };
-  }, []);
+  useDocumentTitle(formatPageTitle("Settings"));
 
   return (
     <div className="page">
@@ -457,7 +463,11 @@ const SettingsView: React.FC = () => {
 
       <section className="settings-section">
         <h2 className="settings-section-title">Evaluations</h2>
-        <div className="settings-row">
+        <div
+          className={`settings-row${highlightClosedSource ? " settings-row-highlight" : ""}`}
+          id="closed-source-evals"
+          ref={closedSourceRow}
+        >
           <label className="settings-row-text" htmlFor="hide-closed-source-evals">
             <span className="settings-row-label">Hide closed-source models</span>
             <span className="settings-row-desc">
@@ -470,7 +480,7 @@ const SettingsView: React.FC = () => {
             id="hide-closed-source-evals"
             checked={preferences.hide_closed_source_evals}
             onCheckedChange={(checked) => {
-              void setHideClosedSourceEvals(Boolean(checked));
+              setHideClosedSourceEvals(Boolean(checked));
             }}
           />
         </div>

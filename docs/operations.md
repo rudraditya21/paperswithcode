@@ -226,6 +226,15 @@ is too short or does not carry the paper's title near the top is recorded under
 `_jobs/web-status/external/<id>.json` and not scraped again; transient failures
 retry with backoff, at most three times.
 
+The same lanes check up to 60 pages per run for whether the reader may show the
+original page in a frame. Each check is a header-only GET that follows redirects
+by hand, requiring HTTPS and publicly routable addresses on every hop. The
+verdict (`framing` in the status record) is refreshed weekly, or daily for
+unreachable pages. The reader frames a page when
+`GET /api/v1/papers/{paper_id}/web-page` reports `frameable`, and always frames
+`*.github.io`, which cannot send framing headers. Every other page is read as
+Markdown.
+
 For MCP operations, start with `pwc-status --component mcp` and inspect
 `journalctl -u paperswithcode-mcp@staging.service` (or `production`). Operational
 MCP telemetry is limited to tool name, status, latency, response bytes, protocol
@@ -385,6 +394,7 @@ sudo pwc-cron mirror_thumbnails_to_disk
 | AI URL extraction stalls | Inspect production CRON health and the matching immutable-release job logs; do not rerun it from the checkout. |
 | Pending edits not landing in DB | Confirm the submitter is signed in (HF session cookie); the `POST /api/v1/me/paper-edits` endpoint requires `require_user`. Then run `SELECT * FROM pending_paper_edits WHERE status='pending' ORDER BY created_at DESC LIMIT 10;` to inspect recent submissions. |
 | Cron logs filling disk | Verify `systemd-tmpfiles` policy; production CRON logs are bounded to 30 days. Use `pwc-status` to include disk usage in the audit. |
+| `chat_config_expiring` / `chat_config_expired` alert, or `pwc-deploy` refuses with "chat configuration expires" | A dated chat value (pinned OpenRouter/OpenAI pricing, executor keys) is within 7 days of expiry or past it. Only the affected chat route fails closed; the site keeps serving. Re-check the pinned prices or rotate the key, update the named `PWC_*` value in `/etc/paperswithcode/<env>.env` (back the file up first), and restart the backend slot. `--allow-expiring-chat-config` lets an urgent hotfix deploy through. See `backend/services/chat_config_expiry.py`. |
 
 ## Pending Paper Edits Review
 
@@ -634,7 +644,7 @@ Configuration is fail-closed. Production direct apply requires all of:
   `hf_xet` runtime never returns its memory to a long-lived API worker);
 - an immutable curator image: either a registry digest or a content-versioned
   public Docker Space plus its exact 40-character Hub revision;
-- pinned model `gpt-5.6-luna`, medium reasoning, and Codex CLI version.
+- pinned model `gpt-6-luna`, medium reasoning, and Codex CLI version.
 
 The production image is published to the Hugging Face container registry as
 `cr.hf.co/nielsr/pwc-codex-curator` and pinned by its runner tag plus digest
@@ -681,6 +691,42 @@ The current image probe is recorded at
 checks the Codex version, PyPDF2 version, full runner SHA-256, exact model, and
 scoped callback-token inheritance. The image is public, so Jobs pull it without
 registry credentials.
+
+### Pi shadow curation
+
+A stable sample of daily papers (`PWC_CURATION_PI_SHADOW_SAMPLE_RATE`, a share
+of paper ids; `0` turns pairing off) also runs each `enrich-paper` and
+`add-evals` stage on the Pi harness with `deepseek-ai/DeepSeek-V4.1-Flash-1017`
+through HF Inference Providers. Right after a sampled Codex stage launches, the
+dispatcher freezes that stage's paper context on a `runner = 'pi'` job
+(`trigger = 'pi-shadow'`, `paired_job_id` → the Codex job) and launches it at
+once. A Pi job is always shadow-only: its proposal is validated against that
+snapshot and stored, never applied. When both jobs are terminal, the Pi row's
+`pair_diff` records tag, link, and evaluation agreement plus status, time, and
+tokens.
+
+Pi jobs use their own pool (`PWC_CURATION_PI_SHADOW_MAX_ACTIVE`, default 2).
+A full pool skips the pair rather than queueing it, so Codex never waits on Pi.
+Pi jobs count toward no Codex slot, health breaker, trace breaker, or token
+guardrail; their weekly outcomes appear under `pi_shadow` in
+`enqueue_hf_daily_paper_curation --status`. Filter the admin curation queue by
+trigger `pi-shadow` to read them.
+
+Pairing also requires a digest-pinned `PWC_CURATION_PI_JOBS_IMAGE` and
+`PWC_CURATION_PI_HF_TOKEN`, a fine-grained token limited to "Make calls to
+Inference Providers" (the agent can read it), billed to
+`PWC_CURATION_PI_BILL_TO` through `X-HF-Bill-To`. The runner prefers the
+`PWC_CURATION_PI_PROVIDER` route (`novita`) and retries once on automatic
+routing when that provider fails before a proposal. The **Build Pi curator
+image** workflow publishes `jobs/Dockerfile.pi-curator` to the same container
+repository as `pi-runner-<hash>` and prints the digest to pin.
+`production_pi_shadow_values()` in `deploy/configure_host_env.py` carries the
+Pi image pin, sample rate, pool size, and billing org for scheduled production
+only (staging stays at rate 0). The `--production-codex-image-only` update
+below installs Codex and Pi pins together. It never writes the token, which is
+stored on its own. Apply
+`backend/database/migrations/add_curation_pi_shadow_runner.sql` before
+deploying a release that maps the new columns.
 
 The private application repository credential is never sent to a remote job.
 After authenticating with its paper-scoped callback token, the runner downloads
@@ -761,9 +807,11 @@ age and becomes critical at five hours. Scheduled dispatch automatically pauses
 after a server invariant breach, three consecutive trace/apply/verification
 failures, a greater-than-20% failure rate in the latest 25 stages, or the
 post-baseline daily token guardrail. Neither failure counter includes
-source-evidence failures or runner transport failures (`Remote runner failed
-(URLError|RemoteDisconnected|TimeoutError|…)`, a callback that never got a
-response), since neither says anything about the curation; more than half of the latest 25
+source-evidence failures (including `[awaiting_markdown]`) or runner transport
+failures (`Remote runner failed
+(URLError|RemoteDisconnected|TimeoutError|HTTPError|JSONDecodeError|…)`, one of
+the runner's own callbacks failing or getting an edge error page instead of
+JSON), since neither says anything about the curation; more than half of the latest 25
 stages failing that way pauses as `runner_transport_failures` instead. Resuming is an explicit acknowledgement
 that resets the consecutive counters and starts a fresh 25-stage failure-rate
 window; a recurring invariant breach still pauses immediately.
@@ -801,6 +849,14 @@ two-job lane, and it still runs while the daily-paper health breakers
 work; an operator, token-guardrail, or policy pause still stops it. They use the curation operator's
 `create_benchmark_from_gap` capability, the only autonomous path that creates
 datasets, metrics, or tasks (see `docs/autonomous-operations.md`).
+
+The same run also queues add-evals re-checks (trigger `benchmark-promotion`,
+policy `new-benchmark-<dataset id>`) for already-indexed papers whose stored
+Markdown names a benchmark whose first leaderboard row is from the last two
+days, whatever created it. `new_benchmark_recheck_service` caps them at 5 per
+benchmark and 20 per run, and the dispatcher runs at most two at once, so the
+admin lane cannot starve daily curation. The curator verifies every row; a
+mention alone writes nothing.
 
 Both kinds run on the existing curator image: the runner treats them as
 paper-less jobs, `jobs/url_preflight.py` skips paper sources for them, and the

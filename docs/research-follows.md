@@ -1,6 +1,7 @@
 # Research follows and weekly email
 
-Follows are private and keyed by the immutable Hugging Face OAuth subject.
+Entity follows are private and keyed by the immutable Hugging Face OAuth subject;
+free-text topics can be public (see below).
 The Following tab sits beside Trending, Newest, and Most cited, using the same
 paper cards and thumbnails. Its bookmarkable feed lives at `/following`; `/settings` manages interests and
 explicit weekly-email opt-in. OAuth email access uses the existing
@@ -19,13 +20,18 @@ strength, publication date, popularity, then canonical ID; round-robin
 selection balances coverage and counts each paper once. Up to 100 interests
 may be followed. Feed pages contain 40 entries.
 
-## Free-text topic
+## Free-text topics
 
-Each account may also describe one topic in its own words (up to 300
-characters, edited in `/settings` or from the Following feed). Topics are
+Each account may also describe up to ten topics in its own words (up to 300
+characters each, edited in `/settings` or from the Following feed). Topics are
 shared rows in `research_topics`, keyed by normalized text (lowercase,
-collapsed whitespace, trailing punctuation stripped); subscriptions point at
-one through `research_subscriptions.topic_id`. Jev (`jev-1.14` through
+collapsed whitespace, trailing punctuation stripped); accounts follow them
+through `research_topic_follows`. The API is `GET/POST /me/topics`,
+`PUT/DELETE /me/topics/{id}` and `PUT /me/topics/order` (every followed id, in
+the account's order, stored in `research_topic_follows.position`; edits keep a
+topic's place and new topics go last). Topic names are shown with a capital
+first letter (sidebar, cards, match reasons, digests); stored text is unchanged; the older single-topic `/me/topic` reads and
+replaces the account's first topic. Jev (`jev-1.14` through
 OpenRouter's `systemone` endpoint) scores each paper's card (title, authors,
 organizations, venue, task/method/benchmark tags, abstract) against the topic,
 and `research_topic_verdicts` keeps the raw score with the card's SHA-256 and
@@ -37,9 +43,12 @@ locally).
 
 Topic matches join entity matches in one feed, deduplicated by paper and
 ranked by the same trending order; the reason line names the topic in quotes.
+The feed's `topic_id` parameter (`/following?topic=<id>`) shows one topic's
+matches; `topic_only` shows every topic's.
 A new topic is backfilled by the per-minute `backfill_research_topics` job:
-every paper from the last 90 days plus the 500 best older matches by dense +
-lexical reciprocal rank fusion, judged once. The hourly
+every paper from the last 90 days, then up to 3,000 older papers ranked by
+dense + lexical reciprocal rank fusion, judged once in batches of 500 until a
+batch has fewer than five matches. The hourly
 `judge_research_topics` job (:54) judges papers in the 90-day window that are
 new or whose card changed, against every followed topic. There is no fallback:
 failed Jev calls leave pairs unjudged for the next run, a failed backfill
@@ -47,7 +56,7 @@ retries up to five times, and CRON health flags papers left unjudged for six
 hours. Staging has its own topic tables and no topic CRON, so staging topics
 stay pending.
 
-Digests list up to 10 topic matches first under "New on your topic", then
+Digests list up to 10 topic matches first under "New on your topics", then
 entity follows. Topic matches use the same paper discovery events as entity
 follows, so only papers discovered after the topic was set can be emailed;
 backfilled papers are feed-only.
@@ -86,6 +95,38 @@ Code: `backend/services/research_follow_service.py` (follows and feed),
 `backend/services/research_delivery_service.py` (digest selection, outbox,
 Resend), and `backend/routers/research.py` (API and
 `POST /api/v1/research/resend-webhook`).
+
+## Public topics
+
+A topic's creator (`research_topics.created_by_hf_subject`, the first account
+to follow its text) decides whether it is public (`is_public`, default true for
+new topics; topics that existed before public topics shipped start private).
+Following a topic means following that exact text: when the creator edits
+theirs, they move to another row and followers stay on the old one, which
+keeps its creator. A creator-less topic goes to its next follower.
+
+- `GET /research/topics/{id}` returns the page header: text, label, creator
+  username and avatar (`https://huggingface.co/api/users/<name>/avatar?redirect=true`),
+  follower count, and up to eight avatars of followers whose
+  `research_subscriptions.show_as_follower` is on (default on for new
+  accounts, off for accounts that existed before the change). Private topics
+  return 404 unless the viewer created or follows them.
+- `GET /research/topics/{id}/papers?order=trending|newest&start_date=&end_date=` lists the topic's
+  matches (verdicts at the threshold, or the embedding preview while the
+  backfill runs), all time unless `start_date`/`end_date` bound it; the topic page asks for the last month by default, like the homepage date filter.
+- `POST /me/topics/{id}/follow` follows a topic by id within the ten-topic
+  limit; `PATCH /me/topics/{id}` with `{"is_public": …}` is creator-only;
+  `PUT /me/topic-follower-visibility` sets the avatar switch.
+- `GET /research/topics/featured` feeds the homepage bubbles: public, not
+  hidden, backfill done, at least five matched papers published in the last
+  30 days, ordered by followers then recent matches, top eight, cached ten
+  minutes.
+
+The SPA page is `/topics/<id>-<slug>` (only the id is read). It is `noindex`
+until a public topic has three followers, and whenever an admin hides it.
+Moderation hides a topic from the bubbles and search engines without touching
+its followers:
+`uv run --env-file backend/keys.env python -m backend.scripts.moderate_research_topics list|hide <id>|unhide <id>`.
 
 ## Operations
 

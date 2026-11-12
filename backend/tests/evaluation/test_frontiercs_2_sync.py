@@ -30,9 +30,6 @@ from backend.models.database import (
 )
 from backend.services import frontiercs_2_sync_service as service
 from backend.services import leaderboard_model_matching_service as matching
-from backend.services.leaderboard_model_matching_service import (
-    title_announces_model,
-)
 from backend.services.frontiercs_2_sync_service import (
     FCI,
     FRONTIERCS_2_DATA_URL,
@@ -45,6 +42,10 @@ from backend.services.frontiercs_2_sync_service import (
     fetch_frontiercs_2,
     parse_frontiercs_2,
 )
+from backend.services.leaderboard_model_matching_service import (
+    title_announces_model,
+)
+from backend.tests.evaluation.model_evidence import add_release_evidence
 
 
 @compiles(BigInteger, "sqlite")
@@ -150,6 +151,21 @@ def test_parse_and_fetch_the_leaderboard_constants():
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     assert fetch_frontiercs_2(client) == leaderboard
+
+
+def test_parser_reads_minified_fractions_without_a_leading_zero():
+    # Since 2026-11-02 the minified data writes 0.2 as ".2" (step's FCI low).
+    current = (
+        Path(__file__).parent / "fixtures" / "frontiercs_2_data_2026-11-06.js"
+    ).read_text()
+    assert "step:[12.1,.2,24.5,48]" in current
+    leaderboard = parse_frontiercs_2(current)
+    assert leaderboard.updated == date(2026, 11, 2)
+    assert len(leaderboard.entries) == 18
+    by_id = {entry.upstream_id: entry for entry in leaderboard.entries}
+    assert (by_id["step"].fci, by_id["step"].fci_low) == (12.1, 0.2)
+    assert by_id["minimax"].fci_low == -8.1
+    assert by_id["carbon"].label == "Gemini 4 Carbon (Antigravity)"
 
 
 @pytest.mark.parametrize(
@@ -353,6 +369,7 @@ def test_new_models_match_an_announcing_title_or_a_model_release():
             PaperHfArtifact(paper_id=2001, hf_artifact_id=1),
         ]
     )
+    add_release_evidence(session, 2001, 2002)
     session.commit()
     source = _new_model(SOURCE, "k3", "Kimi K3.2")
     source = _new_model(source, "terra", "GPT-6.2 Terra")
@@ -383,6 +400,37 @@ def test_new_models_match_an_announcing_title_or_a_model_release():
     }
 
 
+def test_titles_without_evaluations_or_a_release_are_not_matched():
+    session = _session()
+    # Title-only papers ("KNN and ANN-based Recognition of ...") name a model
+    # without introducing it.
+    session.add(
+        Paper(
+            id=2001,
+            title="Kimi K3.2: Open Agentic Intelligence",
+            source="external",
+            source_url="https://www.kimi.com/blog/kimi-k3-2",
+            version="v1",
+            is_latest_version=True,
+        )
+    )
+    session.commit()
+    source = parse_frontiercs_2(_new_model(SOURCE, "k3", "Kimi K3.2"))
+
+    stats = FrontierCS2SyncService(session).sync(source)
+
+    assert stats.auto_matched == []
+    assert stats.unreviewed == ["Kimi K3.2 (Kimi Code)"]
+    assert session.query(ModelReleaseSignal).one().model_name == "Kimi K3.2"
+    assert not session.query(Evaluation).filter_by(paper_id=2001).count()
+
+    add_release_evidence(session, 2001)
+    session.commit()
+    assert FrontierCS2SyncService(session).sync(source).auto_matched == [
+        "Kimi K3.2 (Kimi Code)"
+    ]
+
+
 def test_ambiguous_titles_are_not_matched(monkeypatch):
     session = _session()
     for paper_id, url in ((2001, "https://a.example/x"), (2002, "https://b.example/x")):
@@ -396,6 +444,7 @@ def test_ambiguous_titles_are_not_matched(monkeypatch):
                 is_latest_version=True,
             )
         )
+    add_release_evidence(session, 2001, 2002)
     session.commit()
     stats = FrontierCS2SyncService(session).sync(
         parse_frontiercs_2(_new_model(SOURCE, "k3", "Kimi K3.2"))
@@ -416,6 +465,7 @@ def test_ambiguous_titles_are_not_matched(monkeypatch):
             is_latest_version=True,
         )
     )
+    add_release_evidence(session, 2000)
     session.commit()
     source = parse_frontiercs_2(_new_model(SOURCE, "k3", "Kimi K3.2"))
     assert FrontierCS2SyncService(session).sync(source).auto_matched == [
@@ -437,7 +487,76 @@ def test_ambiguous_titles_are_not_matched(monkeypatch):
         ("Kimi K3.1 Pro: Advancing Open Intelligence", "Kimi K3.1", False),
         ("Evaluating GPT-6.1 Terra on Long Tasks", "GPT-6.1 Terra", False),
         ("GPT-6.1 Terra Is Not Robust", "GPT-6.1 Terra", False),
+        ("Introducing GPT-6 Sol and Luna", "GPT-6 Sol", True),
+        ("Introducing GPT-6 Sol and Luna", "GPT-6", False),
     ],
 )
 def test_title_announces_model(title, name, announces):
     assert title_announces_model(title, name) is announces
+
+
+def test_effort_settings_match_their_base_model():
+    session = _session()
+    session.add(
+        Paper(
+            id=2101,
+            title="Introducing GPT-6 Sol and Luna",
+            source="external",
+            source_url="https://openai.com/index/gpt-6-sol-and-luna",
+            version="v1",
+            is_latest_version=True,
+        )
+    )
+    add_release_evidence(session, 2101)
+    session.commit()
+    matcher = matching.LeaderboardModelMatcher(
+        session,
+        provider="test-board",
+        leaderboard_name="Test",
+        leaderboard_url="https://example.com/board",
+    )
+
+    matched = matcher.match(
+        [
+            matching.LeaderboardModel("GPT-6 Sol (max)", "OpenAI"),
+            matching.LeaderboardModel("GPT-6 Sol (high)", "OpenAI"),
+            matching.LeaderboardModel("GPT-6 Sol (Mini)", "OpenAI"),
+        ]
+    )
+
+    # Settings share the base name, so the board keeps the best one.
+    assert {name: (m.paper_id, m.model_name) for name, m in matched.items()} == {
+        "GPT-6 Sol (max)": (2101, "GPT-6 Sol"),
+        "GPT-6 Sol (high)": (2101, "GPT-6 Sol"),
+    }
+
+
+def test_effort_settings_of_one_model_keep_its_best_row():
+    session = _session()
+    session.add(
+        Paper(
+            id=2102,
+            title="Introducing Effort Model",
+            source="external",
+            source_url="https://lab.example/effort-model",
+            version="v1",
+            is_latest_version=True,
+        )
+    )
+    add_release_evidence(session, 2102)
+    session.commit()
+    # Two Codex CLI rows become two settings of one new model.
+    source = _new_model(SOURCE, "astra", "Effort Model (max)")
+    source = _new_model(source, "sol", "Effort Model (high)")
+    parsed = parse_frontiercs_2(source)
+    best = max(
+        (e for e in parsed.entries if e.name.startswith("Effort Model")),
+        key=lambda e: e.pass_rate,
+    )
+
+    FrontierCS2SyncService(session).sync(parsed)
+
+    effort_rows = [row for row in _rows(session).values() if row.paper_id == 2102]
+    assert len(effort_rows) == 1
+    assert effort_rows[0].model_name.startswith("Effort Model")
+    assert effort_rows[0].metrics[PASS_RATE] == best.pass_rate

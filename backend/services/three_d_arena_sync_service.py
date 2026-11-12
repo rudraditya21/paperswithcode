@@ -12,14 +12,17 @@ import httpx
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
-    Dataset,
     Evaluation,
-    Metric,
     Paper,
-    Task,
-    TaskDatasetMetric,
 )
 from backend.services.evaluation_service import EvaluationService
+from backend.services.leaderboard_model_matching_service import (
+    LeaderboardModel,
+    LeaderboardModelMatcher,
+)
+from backend.services.leaderboard_sync_catalog import (
+    resolve_leaderboard,
+)
 from backend.services.leaderboard_sync_ownership import managed_methodology_prefix
 
 ARENA_ENDPOINT = "https://3d-arena-3d-arena.hf.space/api/leaderboard?vote_type=render"
@@ -55,6 +58,8 @@ MODEL_PAPER_ARXIV_IDS: dict[str, str] = {
     "TripoSR": "2403.02151",
     "LGM": "2402.05054",
     "3DTopia-XL": "2409.12957",
+    "UniLat3D-3DGS": "2509.25079",
+    "UniLat3D-Mesh": "2509.25079",
 }
 
 
@@ -74,6 +79,7 @@ class ArenaSyncStats:
     created: int = 0
     updated: int = 0
     deleted: int = 0
+    auto_matched: list[str] = field(default_factory=list)
     unmatched_models: list[str] = field(default_factory=list)
     missing_papers: list[str] = field(default_factory=list)
 
@@ -84,6 +90,7 @@ class ArenaSyncStats:
             "created": self.created,
             "updated": self.updated,
             "deleted": self.deleted,
+            "auto_matched": self.auto_matched,
             "unmatched_models": self.unmatched_models,
             "missing_papers": self.missing_papers,
         }
@@ -196,27 +203,6 @@ class ThreeDArenaSyncService:
     def __init__(self, db: Session):
         self.db = db
 
-    def _leaderboard_identity(self) -> tuple[Task, Dataset]:
-        task = self.db.query(Task).filter(Task.slug == TASK_SLUG).one_or_none()
-        dataset = (
-            self.db.query(Dataset).filter(Dataset.slug == DATASET_SLUG).one_or_none()
-        )
-        metric = self.db.query(Metric).filter(Metric.name == METRIC_NAME).one_or_none()
-        if task is None or dataset is None or metric is None:
-            raise RuntimeError("3D Arena task, benchmark, or metric is not configured")
-        configured = (
-            self.db.query(TaskDatasetMetric)
-            .filter(
-                TaskDatasetMetric.task_id == task.id,
-                TaskDatasetMetric.dataset_id == dataset.id,
-                TaskDatasetMetric.metric_id == metric.id,
-            )
-            .one_or_none()
-        )
-        if configured is None:
-            raise RuntimeError("3D Arena leaderboard metric is not linked to the task")
-        return task, dataset
-
     def sync(
         self,
         entries: list[ArenaEntry],
@@ -232,7 +218,9 @@ class ThreeDArenaSyncService:
         stats = ArenaSyncStats(fetched=len(entries))
 
         try:
-            task, dataset = self._leaderboard_identity()
+            task, dataset = resolve_leaderboard(
+                self.db, "3D Arena", TASK_SLUG, DATASET_SLUG, (METRIC_NAME,)
+            )
             paper_ids_by_arxiv = {
                 paper.arxiv_id: paper.id
                 for paper in self.db.query(Paper)
@@ -263,16 +251,38 @@ class ThreeDArenaSyncService:
                 managed_by_name[row.model_name] = keep
                 duplicate_rows.append(discard)
             upstream_names = {entry.name for entry in entries}
+            # Models outside the manifest go to the shared matcher; the rest
+            # become release-radar signals. The Space publishes no organization,
+            # so the product name stands in for the lab: "3D Arena" would make
+            # the leaderboard Space itself look like a first-party source.
+            unknown = [
+                LeaderboardModel(entry.name, entry.name)
+                for entry in entries
+                if entry.name not in MODEL_PAPER_ARXIV_IDS
+            ]
+            matcher = LeaderboardModelMatcher(
+                self.db,
+                provider="3d-arena",
+                leaderboard_name="3D Arena",
+                leaderboard_url=ARENA_SOURCE_URL,
+            )
+            auto_matched = matcher.match(unknown)
 
             for entry in entries:
                 arxiv_id = MODEL_PAPER_ARXIV_IDS.get(entry.name)
+                hf_model_url = None
                 if arxiv_id is None:
-                    stats.unmatched_models.append(entry.name)
-                    continue
-                paper_id = paper_ids_by_arxiv.get(arxiv_id)
-                if paper_id is None:
-                    stats.missing_papers.append(f"{entry.name}:{arxiv_id}")
-                    continue
+                    match = auto_matched.get(entry.name)
+                    if match is None:
+                        stats.unmatched_models.append(entry.name)
+                        continue
+                    paper_id, hf_model_url = match.paper_id, match.hf_model_url
+                    stats.auto_matched.append(entry.name)
+                else:
+                    paper_id = paper_ids_by_arxiv.get(arxiv_id)
+                    if paper_id is None:
+                        stats.missing_papers.append(f"{entry.name}:{arxiv_id}")
+                        continue
 
                 methodology = (
                     f"{MANAGED_METHODOLOGY_PREFIX} Upstream rank {entry.rank}; "
@@ -295,6 +305,8 @@ class ThreeDArenaSyncService:
                 row.metrics = {METRIC_NAME: entry.score}
                 row.uses_additional_data = False
                 row.is_open = entry.open_source
+                if hf_model_url:
+                    row.hf_model_url = hf_model_url
                 row.best_metric = METRIC_NAME
                 row.evaluated_on = now.date()
                 row.external_source_url = ARENA_SOURCE_URL
@@ -303,6 +315,9 @@ class ThreeDArenaSyncService:
                 row.updated_at = now
                 stats.matched += 1
 
+            matcher.report_unmatched(
+                [model for model in unknown if model.name not in auto_matched]
+            )
             # A successful, validated upstream response is authoritative for model
             # presence. Rows whose model disappeared are removed, while a current
             # but temporarily unresolved model is protected from deletion.

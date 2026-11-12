@@ -1,15 +1,14 @@
 import ResearchFollowButton from "@/components/ResearchFollowButton";
 import React, { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowRight, Github, Trophy } from "lucide-react";
 
-import { MethodChip, PaperCard } from "@/components";
+import { MethodChip } from "@/components/Chips";
+import { PaperFeedList, PaperFeedToolbar } from "@/components/PaperFeed";
 import { AstraRoboticsFeature } from "@/components/AstraRoboticsFeature";
 import BenchmarkTrendSparkline from "@/components/BenchmarkTrendSparkline";
 import { groupBenchmarkVariants, variantLabel } from "@/lib/benchmarkVariants";
-import { PaperFeedFilters } from "@/components/PaperFeedFilters";
-import { PaperDateFilter } from "@/components/PaperDateFilter";
 import MarkdownText from "@/components/MarkdownText";
 import type {
   Area,
@@ -18,30 +17,19 @@ import type {
   Task,
   TrendingBenchmark,
 } from "@/lib/api/catalog.types";
-import { catalogApi } from "@/lib/api/catalog";
+import { papersApi } from "@/lib/api/papers";
 import { assetUrl } from "@/lib/apiUrl";
-import { usePreferences } from "@/lib/preferencesContext";
+import { formatStarCount } from "@/lib/frameworks";
+
+import { usePreferences } from "@/lib/preferences";
 import { slugify } from "@/lib/slug";
 import { displayTaskName, transformPaperForCard } from "@/lib/transform";
-import { useInfiniteTaskPapers } from "@/hooks/usePapers";
-import { useIntersectionObserver } from "@/hooks/useIntersectionObserver";
+import { usePaperFeedParams } from "@/hooks/usePaperFeedParams";
+import { usePaperFeedQuery } from "@/hooks/usePapers";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { readPaperDateRange, withPaperDateRange } from "@/lib/paperDateRange";
-
-type OrderBy = "trending" | "date_published" | "citation_count";
-const SORT_OPTIONS: Array<[OrderBy, string]> = [
-  ["trending", "trending"],
-  ["date_published", "newest"],
-  ["citation_count", "most cited"],
-];
-
-const parseOrderBy = (value: string | null): OrderBy => {
-  if (value === "trending" || value === "date_published" || value === "citation_count") {
-    return value;
-  }
-  return "trending";
-};
+import NotFound from "@/pages/NotFound";
+import { loadFailurePage } from "@/components/LoadFailurePage";
+import { catalogQueries, paperFeedKeys } from "@/lib/api/queries";
 
 const SUBTASK_BENCH_PREVIEW = 3;
 
@@ -75,12 +63,6 @@ const HEALTHCARE_HUB_DESTINATIONS = [
     href: "/tasks/medical-visual-question-answering",
   },
 ] as const;
-
-const formatStarCount = (stars: number) =>
-  new Intl.NumberFormat("en", {
-    notation: stars >= 1000 ? "compact" : "standard",
-    maximumFractionDigits: 1,
-  }).format(stars);
 
 export const RecommendedFrameworkLinks: React.FC<{
   frameworks: RecommendedFramework[];
@@ -188,40 +170,36 @@ export const HealthcareMedicalAiHub: React.FC<{
   );
 };
 
-const sortSubtasksForDisplay = (subtasks: Task[]) =>
-  [...subtasks].sort((a, b) => {
-    const aIsClassic = a.slug === "classic-language-modeling";
-    const bIsClassic = b.slug === "classic-language-modeling";
+/** Hand-tuned presentation for individual task pages; every other task uses the defaults. */
+interface TaskPagePresentation {
+  wideHero?: boolean;
+  compactFigure?: boolean;
+  /** A feature section between the hero and the benchmarks. */
+  feature?: React.FC<{ task: Task; relatedTasks: Task[] }>;
+  /** The feature already links the related tasks, so the sidebar does not repeat them. */
+  featureListsRelatedTasks?: boolean;
+}
 
-    if (aIsClassic !== bIsClassic) return aIsClassic ? 1 : -1;
-    return 0;
-  });
+const TASK_PAGES: Record<string, TaskPagePresentation> = {
+  "auto-research": { wideHero: true },
+  "omni-models": { compactFigure: true },
+  healthcare: { feature: HealthcareMedicalAiHub, featureListsRelatedTasks: true },
+  robotics: { feature: AstraRoboticsFeature },
+};
+
+/** Subtasks kept after the others, such as the pre-LLM language-modeling lineage. */
+const SUBTASKS_LISTED_LAST: ReadonlySet<string | undefined> = new Set(["classic-language-modeling"]);
+
+const sortSubtasksForDisplay = (subtasks: Task[]) =>
+  [...subtasks].sort(
+    (a, b) => Number(SUBTASKS_LISTED_LAST.has(a.slug)) - Number(SUBTASKS_LISTED_LAST.has(b.slug)),
+  );
 
 const TagBrowseView: React.FC = () => {
   const { taskSlug } = useParams<{ taskSlug: string }>();
   const navigate = useNavigate();
-  const [searchParams, setSearchParams] = useSearchParams();
-  const orderBy = parseOrderBy(searchParams.get("order_by"));
-  const hasCode = searchParams.get("has_code") === "true";
-  const hasHfArtifacts = searchParams.get("has_hf_artifacts") === "true";
-  const dateRange = readPaperDateRange(searchParams);
-  const setOrderBy = (next: OrderBy) => {
-    const params = new URLSearchParams(searchParams);
-    params.set("order_by", next);
-    setSearchParams(params);
-  };
-  const setHasCode = (active: boolean) => {
-    const params = new URLSearchParams(searchParams);
-    if (active) params.set("has_code", "true");
-    else params.delete("has_code");
-    setSearchParams(params);
-  };
-  const setHasHfArtifacts = (active: boolean) => {
-    const params = new URLSearchParams(searchParams);
-    if (active) params.set("has_hf_artifacts", "true");
-    else params.delete("has_hf_artifacts");
-    setSearchParams(params);
-  };
+  const feed = usePaperFeedParams({ defaultToLastMonth: true });
+  const { searchParams } = feed;
   const [benchmarksExpanded, setBenchmarksExpanded] = useState(false);
   // Selected protocol tab per benchmark group, keyed by the group's root id.
   const [selectedVariants, setSelectedVariants] = useState<Record<string, string>>({});
@@ -242,12 +220,7 @@ const TagBrowseView: React.FC = () => {
   // chain, sister tasks, visible children, this task's benchmarks, and a short
   // benchmark preview per child. This replaces the previous fan-out of six+
   // independent task/dataset queries on initial load (see Speed plan §1).
-  const pageQ = useQuery({
-    queryKey: ["task-page", taskSlug, bestModelIsOpen],
-    queryFn: () => catalogApi.taskPage(taskSlug!, { is_open: bestModelIsOpen }),
-    enabled: !!taskSlug,
-    staleTime: 10 * 60 * 1000,
-  });
+  const pageQ = useQuery(catalogQueries.taskPage(taskSlug, { is_open: bestModelIsOpen }));
 
   useEffect(() => {
     const canonicalSlug = pageQ.data?.task.slug;
@@ -257,17 +230,11 @@ const TagBrowseView: React.FC = () => {
     navigate(`/tasks/${canonicalSlug}${query ? `?${query}` : ""}`, { replace: true });
   }, [navigate, pageQ.data?.task.slug, searchParams, taskSlug]);
 
-  const benchmarkTrendsQ = useQuery({
-    queryKey: ["task-benchmark-trends", taskSlug, bestModelIsOpen],
-    queryFn: () =>
-      catalogApi.trendingBenchmarks(taskSlug!, {
-        limit: 100,
-        min_recent_papers: 0,
-        is_open: bestModelIsOpen,
-      }),
-    enabled: !!taskSlug,
-    staleTime: 10 * 60 * 1000,
-  });
+  const benchmarkTrendsQ = useQuery(catalogQueries.taskBenchmarkTrends(taskSlug, {
+    limit: 100,
+    min_recent_papers: 0,
+    is_open: bestModelIsOpen,
+  }));
 
   // Subtasks (child tasks). Classic LM is the historical catch-all, so keep it
   // after the capability-oriented subtasks.
@@ -288,23 +255,18 @@ const TagBrowseView: React.FC = () => {
 
   // The papers endpoint resolves slugs itself, so start the feed in parallel
   // with the task-page shell instead of waiting for its task id.
-  const papersQ = useInfiniteTaskPapers({
-    taskId: taskSlug || "",
-    page_size: 20,
-    order_by: orderBy,
-    order_dir: "desc",
-    include_resources: true,
-    has_code: hasCode,
-    has_hf_artifacts: hasHfArtifacts,
-    start_date: dateRange.startDate,
-    end_date: dateRange.endDate,
-    enabled: !!taskSlug,
-  });
+  const papersQ = usePaperFeedQuery(
+    paperFeedKeys.task(taskSlug, feed.filters),
+    // Cards show only the leading repository; highly cited papers can
+    // otherwise carry hundreds of community implementations each.
+    (page) => papersApi.forTask(taskSlug!, { ...feed.filters, page, page_size: 20, repository_limit: 1 }),
+    { enabled: !!taskSlug },
+  );
 
-  const cards = useMemo(() => {
-    const all = papersQ.data?.pages.flatMap((p) => p.results) || [];
-    return all.map(transformPaperForCard);
-  }, [papersQ.data]);
+  const cards = useMemo(
+    () => papersQ.data?.pages.flatMap((page) => page.results.map(transformPaperForCard)) ?? [],
+    [papersQ.data],
+  );
 
   // Common methods: derived from the loaded papers' methods array.
   const commonMethods = useMemo(() => {
@@ -321,13 +283,6 @@ const TagBrowseView: React.FC = () => {
     return Object.values(counts).sort((a, b) => b.count - a.count).slice(0, 8);
   }, [papersQ.data]);
 
-  const { targetRef: sentinelRef, isIntersecting } = useIntersectionObserver({ rootMargin: "200px" });
-  useEffect(() => {
-    if (isIntersecting && papersQ.hasNextPage && !papersQ.isFetchingNextPage) {
-      papersQ.fetchNextPage();
-    }
-  }, [isIntersecting, papersQ.hasNextPage, papersQ.isFetchingNextPage]); // eslint-disable-line react-hooks/exhaustive-deps
-
   if (pageQ.isLoading) {
     return (
       <div className="page">
@@ -338,20 +293,16 @@ const TagBrowseView: React.FC = () => {
     );
   }
 
-  if (pageQ.error || !pageQ.data) {
-    return (
-      <div className="page">
-        <Alert variant="destructive">
-          <AlertDescription>Task not found.</AlertDescription>
-        </Alert>
-      </div>
-    );
+  if (!pageQ.data) {
+    return loadFailurePage([pageQ.error], "Failed to load this task. Please try again.") ?? <NotFound />;
   }
 
   const task = pageQ.data.task;
   const parents = pageQ.data.parents || [];
   const taskName = displayTaskName(task.name, task.slug);
   const sisters = (pageQ.data.sisters || []).filter((s) => s.id !== task.id);
+  const presentation: TaskPagePresentation = (task.slug && TASK_PAGES[task.slug]) || {};
+  const Feature = presentation.feature;
   const recommendedFrameworks = pageQ.data.recommended_frameworks || [];
   const datasets = pageQ.data.benchmarks || [];
   const datasetsById = new Map(datasets.map((dataset) => [dataset.id, dataset]));
@@ -437,7 +388,7 @@ const TagBrowseView: React.FC = () => {
       <div
         className={
           task.image_url
-            ? `task-hero-grid${task.slug === "auto-research" ? " task-hero-grid--wide" : ""}`
+            ? `task-hero-grid${presentation.wideHero ? " task-hero-grid--wide" : ""}`
             : undefined
         }
       >
@@ -465,9 +416,7 @@ const TagBrowseView: React.FC = () => {
         </div>
         {task.image_url && (
           <figure
-            className={`task-figure-card${
-              task.slug === "omni-models" ? " task-figure-card--compact" : ""
-            }`}
+            className={`task-figure-card${presentation.compactFigure ? " task-figure-card--compact" : ""}`}
           >
             <div className="task-figure-img-wrap">
               <img
@@ -492,11 +441,7 @@ const TagBrowseView: React.FC = () => {
         )}
       </div>
 
-      {task.slug === "healthcare" && (
-        <HealthcareMedicalAiHub task={task} relatedTasks={sisters} />
-      )}
-
-      {task.slug === "robotics" && <AstraRoboticsFeature />}
+      {Feature && <Feature task={task} relatedTasks={sisters} />}
 
       <div className="task-page-grid" style={{ marginTop: 28 }}>
         <div>
@@ -750,58 +695,13 @@ const TagBrowseView: React.FC = () => {
             </div>
           </div>
 
-          <div className="sort-bar">
-            <div className="paper-feed-toolbar-controls">
-              <div className="sort-options">
-                {SORT_OPTIONS.map(([k, l]) => (
-                  <button
-                    key={k}
-                    className={`sort-btn ${orderBy === k ? "active" : ""}`}
-                    onClick={() => setOrderBy(k)}
-                  >
-                    {l}
-                  </button>
-                ))}
-              </div>
-              <PaperFeedFilters
-                hasCode={hasCode}
-                hasHfArtifacts={hasHfArtifacts}
-                onHasCodeChange={setHasCode}
-                onHasHfArtifactsChange={setHasHfArtifacts}
-              />
-            </div>
-            <PaperDateFilter
-              startDate={dateRange.startDate}
-              endDate={dateRange.endDate}
-              onChange={(value) => setSearchParams(withPaperDateRange(searchParams, value))}
-            />
-          </div>
+          <PaperFeedToolbar feed={feed} />
 
-          {papersQ.isLoading ? (
-            <div className="paper-list">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <Skeleton key={i} className="h-40 w-full" />
-              ))}
-            </div>
-          ) : cards.length === 0 ? (
-            <div className="no-results">No papers in this task yet.</div>
-          ) : (
-            <>
-              <div className="paper-list">
-                {cards.map((p, i) => (
-                  <PaperCard key={p.id} paper={p} rank={i + 1} />
-                ))}
-              </div>
-              <div ref={sentinelRef} style={{ height: 1 }} />
-              {papersQ.isFetchingNextPage && (
-                <div style={{ padding: "20px 0", textAlign: "center", color: "var(--ink-faint)" }}>Loading more…</div>
-              )}
-            </>
-          )}
+          <PaperFeedList query={papersQ} cards={cards} empty={feed.dateRange.startDate || feed.dateRange.endDate ? "No papers in this task in this date range." : "No papers in this task yet."} />
         </div>
 
         <aside className="task-side">
-          {sisters.length > 0 && task.slug !== "healthcare" && (
+          {sisters.length > 0 && !presentation.featureListsRelatedTasks && (
             <div className="side-block">
               <div className="side-block-num">01/</div>
               <div className="side-block-label">Sister Tasks</div>

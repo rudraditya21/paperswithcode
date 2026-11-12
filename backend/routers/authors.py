@@ -6,7 +6,7 @@ original PapersWithCode API specification with enhancements.
 """
 
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, Path
+from fastapi import APIRouter, Depends, HTTPException, Query, Path, Response
 from sqlalchemy.orm import Session
 
 from backend.database.connection import get_database_session
@@ -16,7 +16,8 @@ from backend.models.papers import (
     Papers,
 )
 from backend.services.author_service import AuthorService
-from backend.utils.exceptions import PaperNotFoundError, DatabaseError
+from backend.utils.exceptions import PaperNotFoundError
+from backend.utils.organization_logos import organization_logo_extension
 
 router = APIRouter()
 
@@ -73,31 +74,21 @@ def get_authors(
     - Paper count statistics
     - Pagination metadata (next/previous page numbers)
     """
-    try:
-        author_service = AuthorService(db)
-
-        if search:
-            # Use search functionality for better results
-            return author_service.search_authors(
-                query=search,
-                page=page,
-                page_size=page_size,
-                hf_users_only=hf_users_only,
-            )
-        else:
-            # Regular listing with filters
-            return author_service.get_authors(
-                page=page,
-                page_size=page_size,
-                hf_users_only=hf_users_only,
-                order_by=order_by,
-                order_dir=order_dir,
-            )
-
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    author_service = AuthorService(db)
+    if search:
+        return author_service.search_authors(
+            query=search,
+            page=page,
+            page_size=page_size,
+            hf_users_only=hf_users_only,
+        )
+    return author_service.get_authors(
+        page=page,
+        page_size=page_size,
+        hf_users_only=hf_users_only,
+        order_by=order_by,
+        order_dir=order_dir,
+    )
 
 
 @router.get(
@@ -129,16 +120,34 @@ def get_author(
     - `400 Bad Request`: Invalid author ID format
     - `500 Internal Server Error`: Database or server error
     """
-    try:
-        author_service = AuthorService(db)
-        return author_service.get_author_by_id(author_id)
+    return AuthorService(db).get_author_by_id(author_id)
 
-    except PaperNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@router.get(
+    "/authors/{author_id}/photo/{sha256}.{extension}",
+    summary="Serve a self-hosted author photo",
+)
+def get_author_photo(
+    author_id: int,
+    sha256: str,
+    extension: str,
+    db: Session = Depends(get_database_session),
+):
+    try:
+        photo = AuthorService(db).get_photo(author_id, sha256)
+    except PaperNotFoundError:
+        raise HTTPException(status_code=404, detail="Photo not available")
+    if organization_logo_extension(photo.mime_type) != extension:
+        raise HTTPException(status_code=404, detail="Photo format not available")
+    # The URL names the photo's digest, so its bytes never change.
+    return Response(
+        content=photo.image_data,
+        media_type=photo.mime_type,
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "CDN-Cache-Control": "public, max-age=31536000, immutable",
+        },
+    )
 
 
 @router.get(
@@ -198,20 +207,11 @@ def get_author_papers(
     - `400 Bad Request`: Invalid author ID or query parameters
     - `500 Internal Server Error`: Database or server error
     """
-    try:
-        author_service = AuthorService(db)
-        return author_service.get_author_papers(
-            author_id=author_id,
-            page=page,
-            page_size=page_size,
-            latest_only=latest_only,
-            order_by=order_by,
-            order_dir=order_dir,
-        )
-
-    except PaperNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    return AuthorService(db).get_author_papers(
+        author_id=author_id,
+        page=page,
+        page_size=page_size,
+        latest_only=latest_only,
+        order_by=order_by,
+        order_dir=order_dir,
+    )

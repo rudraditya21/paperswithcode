@@ -27,7 +27,8 @@ Priority modes (selected via --priority):
 - `external-missing`: sweep over non-ArXiv external papers missing an explicit
   captured thumbnail. Direct PDF source URLs are rendered from page one; bioRxiv
   and medRxiv papers use the bioRxiv API plus Europe PMC / S3 TDM mirrors;
-  other source pages are captured with headless Chrome.
+  other source pages use their social preview artwork (`og:image` /
+  `twitter:image`), and a title card only when they have none.
 
 The local cache is the source of truth for "do we have this thumbnail" during
 backfills: candidates whose .jpg already exists on disk are skipped without any
@@ -239,7 +240,8 @@ class ThumbnailPreloadJob(CronJobBase):
             session.query(DBPaper.id, DBPaper.arxiv_id, DBPaper.version)
             .filter(and_(*filters))
             .order_by(
-                DBPaper.date_published.desc(),
+                # Undated papers must not crowd dated recent papers out of --limit.
+                DBPaper.date_published.desc().nullslast(),
                 DBPaper.id.desc(),
             )
         )

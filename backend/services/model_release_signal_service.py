@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from urllib.parse import urlsplit
@@ -57,7 +58,10 @@ from backend.services.trending_model_resolution_service import (
 # reappear in a later run before it costs a curation job. Vendor feeds are
 # first-party and qualify on their first sighting.
 WEB_SEARCH_MIN_SIGHTINGS = 2
-MAX_RADAR_JOBS_PER_DAY = 6
+# Leaderboard syncs report every unmatched model, so the backlog can reach
+# hundreds; resolve jobs mostly succeed and the curation runner handles
+# ~150+ jobs a day, so a backlog clears in about a week.
+MAX_RADAR_JOBS_PER_DAY = 30
 # A failed resolution is retried once the release has been seen again after
 # this long, so a transient Job failure does not drop the release.
 FAILED_RETRY_AFTER = timedelta(days=2)
@@ -201,7 +205,12 @@ def queue_release_signals(
             ),
         )
         .order_by(
-            ModelReleaseSignal.published.desc().nullslast(),
+            # Leaderboard signals have no publication date; without the
+            # fallback they sort after every dated signal and never run.
+            func.coalesce(
+                ModelReleaseSignal.published,
+                func.date(ModelReleaseSignal.first_seen_at),
+            ).desc(),
             ModelReleaseSignal.first_seen_at,
         )
         .limit(budget)
@@ -322,6 +331,22 @@ def _names_match(token: str, name: str, *, account: bool) -> bool:
     # Accounts append anything ("RecursiveSI"); a domain may append only a
     # corporate suffix ("mistralai"), so "kimiupdates.com" is not Kimi's.
     return account or token[len(name) :] in _CORPORATE_SUFFIXES
+
+
+def is_english_text(text: str) -> bool:
+    """Whether ``text`` is written in Latin script, our proxy for English.
+
+    Model names and stray symbols ("λ", "×") are tolerated; a headline or
+    summary written in Korean, Japanese, Chinese, Cyrillic, etc. is not.
+    """
+    letters = [char for char in text if char.isalpha()]
+    if not letters:
+        return True
+    foreign = sum(
+        not unicodedata.name(char, "").startswith(("LATIN", "GREEK"))
+        for char in letters
+    )
+    return foreign / len(letters) <= 0.1
 
 
 def is_first_party_source(
@@ -498,6 +523,11 @@ class ReleaseSignalResolutionService:
             raise ValueError(
                 "An external paper's source_url must be the publisher's own "
                 "announcement, model card, or repository, not a news or mirror page"
+            )
+        if not is_english_text(f"{external.title} {external.abstract}"):
+            raise ValueError(
+                "External papers must be in English; resolve with the lab's "
+                "English announcement or model card, or reject the release"
             )
         if external.date_published > date.today() + timedelta(days=1):
             raise ValueError("External paper date_published is in the future")

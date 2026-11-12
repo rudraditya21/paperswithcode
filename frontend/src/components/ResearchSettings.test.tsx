@@ -12,96 +12,45 @@ function wrapper({ children }: { children: React.ReactNode }) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   return <QueryClientProvider client={client}><MemoryRouter>{children}</MemoryRouter></QueryClientProvider>;
 }
-beforeEach(() => { vi.spyOn(researchApi, 'topic').mockResolvedValue(null); });
+beforeEach(() => { vi.spyOn(researchApi, 'topics').mockResolvedValue([]); });
 afterEach(() => vi.restoreAllMocks());
-describe('research topic', () => {
-  const saved = { text: 'real-time video generation', set_at: '2026-10-28T10:00:00Z', status: 'pending' as const,
-    judged: 0, total: null, suggestions: [] };
-  it('saves a trimmed topic and reports backfill progress', async () => {
+describe('Settings research section', () => {
+  beforeEach(() => {
     vi.spyOn(researchApi, 'follows').mockResolvedValue([]);
-    vi.spyOn(researchApi, 'email').mockResolvedValue({ enabled: false, email: null, suppressed: false, delivery_ready: true });
-    const set = vi.spyOn(researchApi, 'setTopic').mockResolvedValue({ ...saved, status: 'running', judged: 200, total: 4700 });
-    render(<ResearchSettings />, { wrapper });
-    const input = await screen.findByRole('textbox', { name: 'Research topic' });
-    expect(screen.getByRole('button', { name: 'Follow topic' })).toBeDisabled();
-    fireEvent.change(input, { target: { value: '  real-time   video generation ' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Follow topic' }));
-    await waitFor(() => expect(set).toHaveBeenCalledWith('real-time video generation'));
-    expect(await screen.findByText('Finding matching papers: 200 of 4,700 checked…')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Update topic' })).toBeDisabled();
+    vi.spyOn(researchApi, 'email').mockResolvedValue({ enabled: false, email: null, suppressed: false, delivery_ready: true, show_as_follower: true });
   });
-  it('removes the topic and names exact catalog matches', async () => {
-    vi.mocked(researchApi.topic).mockResolvedValue({ ...saved, status: 'done', suggestions: [
-      { kind: 'task', entity_id: 3, name: 'Video Generation', url: '/tasks/video-generation' },
-    ] });
-    vi.spyOn(researchApi, 'follows').mockResolvedValue([]);
-    vi.spyOn(researchApi, 'email').mockResolvedValue({ enabled: false, email: null, suppressed: false, delivery_ready: true });
-    const clear = vi.spyOn(researchApi, 'clearTopic').mockResolvedValue();
+  it('sends topic and follow management to the Edit feed pop-up', async () => {
+    vi.mocked(researchApi.follows).mockResolvedValue([
+      { kind: 'task', entity_id: 1, name: 'Alpha', url: '/tasks/alpha', created_at: '2026-10-01T10:00:00Z' },
+    ]);
     render(<ResearchSettings />, { wrapper });
-    expect(await screen.findByRole('link', { name: 'Video Generation' })).toHaveAttribute('href', '/tasks/video-generation');
-    expect(screen.getByText(/new ones are added every hour/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Remove' }));
-    await waitFor(() => expect(clear).toHaveBeenCalled());
-    expect(await screen.findByRole('button', { name: 'Follow topic' })).toBeInTheDocument();
-    expect(screen.getByRole('textbox', { name: 'Research topic' })).toHaveValue('');
+    expect(await screen.findByRole('link', { name: /Edit feed/ })).toHaveAttribute('href', '/following?edit=1');
+    expect(await screen.findByText('1')).toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Unfollow/ })).not.toBeInTheDocument();
   });
-  it('lets a failed topic be saved again unchanged to retry', async () => {
-    vi.mocked(researchApi.topic).mockResolvedValue({ ...saved, status: 'failed' });
-    vi.spyOn(researchApi, 'follows').mockResolvedValue([]);
-    vi.spyOn(researchApi, 'email').mockResolvedValue({ enabled: false, email: null, suppressed: false, delivery_ready: true });
-    const set = vi.spyOn(researchApi, 'setTopic').mockResolvedValue(saved);
+  it('turns the follower avatar off', async () => {
+    const save = vi.spyOn(researchApi, 'setShowAsFollower').mockResolvedValue();
     render(<ResearchSettings />, { wrapper });
-    fireEvent.click(await screen.findByRole('button', { name: 'Retry' }));
-    await waitFor(() => expect(set).toHaveBeenCalledWith('real-time video generation'));
+    const toggle = await screen.findByRole('switch', { name: /Show my avatar/ });
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(save).toHaveBeenCalledWith(false));
+    await waitFor(() => expect(toggle).not.toBeChecked());
   });
 });
 describe('research follows', () => {
   it('shows the verified destination, disabled-delivery status, and explicit opt-in', async () => {
     vi.spyOn(researchApi, 'follows').mockResolvedValue([]);
-    const preferences = { enabled: false, email: 'alice@example.com', suppressed: false, delivery_ready: false };
+    const preferences = { enabled: false, email: 'alice@example.com', suppressed: false, delivery_ready: false, show_as_follower: true };
     vi.spyOn(researchApi, 'email').mockResolvedValue(preferences);
     const save = vi.spyOn(researchApi, 'setEmail').mockResolvedValue({ ...preferences, enabled: true });
     render(<ResearchSettings />, { wrapper });
     expect(await screen.findByText('alice@example.com')).toBeInTheDocument();
     expect(screen.getByText(/Weekly emails have not launched yet/)).toBeInTheDocument();
     expect(save).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('switch'));
+    fireEvent.click(screen.getByRole('switch', { name: /weekly digest/i }));
     await waitFor(() => expect(save).toHaveBeenCalledWith(true, expect.anything()));
-  });
-  it('groups follows by kind and lets an unfollow be undone in place before refetching', async () => {
-    const follow = { kind: 'method' as const, entity_id: 7, name: 'Mixture of Experts', url: '/methods/moe', created_at: '2026-10-03T10:00:00Z' };
-    const list = vi.spyOn(researchApi, 'follows').mockResolvedValue([follow]);
-    vi.spyOn(researchApi, 'email').mockResolvedValue({ enabled: false, email: null, suppressed: false, delivery_ready: true });
-    const change = vi.spyOn(researchApi, 'setFollow').mockResolvedValue();
-    render(<ResearchSettings />, { wrapper });
-    expect(await screen.findByRole('heading', { name: 'Methods' })).toBeInTheDocument();
-    expect(screen.getByRole('switch')).toBeDisabled();
-    // Refetches never settle, so every state change must come from the mutation itself.
-    list.mockReturnValue(new Promise(() => {}));
-    fireEvent.click(screen.getByRole('button', { name: 'Unfollow Mixture of Experts' }));
-    await waitFor(() => expect(change).toHaveBeenCalledWith('method', 7, false));
-    expect(await screen.findByRole('button', { name: 'Follow Mixture of Experts' })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Follow Mixture of Experts' }));
-    await waitFor(() => expect(change).toHaveBeenCalledWith('method', 7, true));
-    expect(await screen.findByRole('button', { name: 'Unfollow Mixture of Experts' })).toBeInTheDocument();
-    expect(screen.queryByText(/not following anything/)).not.toBeInTheDocument();
-  });
-  it('blocks overlapping unfollows so an interest is listed once', async () => {
-    const a = { kind: 'task' as const, entity_id: 1, name: 'Alpha', url: '/tasks/alpha', created_at: '2026-10-01T10:00:00Z' };
-    const b = { kind: 'task' as const, entity_id: 2, name: 'Beta', url: '/tasks/beta', created_at: '2026-10-01T10:00:00Z' };
-    const list = vi.spyOn(researchApi, 'follows').mockResolvedValue([a, b]);
-    vi.spyOn(researchApi, 'email').mockResolvedValue({ enabled: false, email: null, suppressed: false, delivery_ready: true });
-    let finish = () => {};
-    const change = vi.spyOn(researchApi, 'setFollow').mockReturnValue(new Promise<void>(resolve => { finish = resolve; }));
-    render(<ResearchSettings />, { wrapper });
-    const unfollowAlpha = await screen.findByRole('button', { name: 'Unfollow Alpha' });
-    list.mockReturnValue(new Promise(() => {}));
-    fireEvent.click(unfollowAlpha);
-    fireEvent.click(unfollowAlpha);
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Unfollow Beta' })).toBeDisabled());
-    finish();
-    expect(await screen.findAllByRole('button', { name: 'Follow Alpha' })).toHaveLength(1);
-    expect(change).toHaveBeenCalledWith('task', 1, false);
   });
   it('follows and unfollows with the stable entity id', async () => {
     const list = vi.spyOn(researchApi, 'follows').mockResolvedValue([]);
@@ -144,7 +93,7 @@ describe('research follows', () => {
     ]);
     fireEvent.click(screen.getByRole('button', { name: 'Follow' }));
     expect(await screen.findByText(/Added to/)).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Manage in Settings' })).toHaveAttribute('href', '/settings');
+    expect(screen.getByRole('link', { name: 'Edit feed' })).toHaveAttribute('href', '/following?edit=1');
     rerender(<ResearchFollowButton kind="task" entityId="13" />);
     expect(screen.getByRole('button', { name: 'Unfollow' })).toBeInTheDocument();
     expect(screen.queryByText(/Added to/)).not.toBeInTheDocument();

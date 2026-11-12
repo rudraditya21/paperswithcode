@@ -241,6 +241,19 @@ def test_descendants_privacy_methods_and_canonical_versions(db, now):
     )
 
 
+def test_follows_carry_a_subtasks_parent_slug(db, now):
+    parent = Task(name="Parent", slug="parent-task")
+    db.add(parent)
+    db.flush()
+    child = Task(name="Child", slug="child-task", parent_id=parent.id)
+    db.add(child)
+    db.flush()
+    follow(db, "task", parent, now)
+    follow(db, "task", child, now)
+    listed = {f.name: f.parent_slug for f in follows.follows(db, "alice")}
+    assert listed == {"Parent": None, "Child": "parent-task"}
+
+
 def test_all_entity_types_and_feed_backfill_not_email(db, now):
     p = paper(db, now)
     author = Author(name="Author")
@@ -392,9 +405,14 @@ def test_api_ownership_optin_and_unsubscribe(db, now, monkeypatch):
     assert client.get("/me/follows").json() == []
     assert client.put(f"/me/follows/task/{t.id}").status_code == 204
     assert len(client.get("/me/follows").json()) == 1
+    assert client.get(f"/me/following?follow=task:{t.id}").status_code == 200
+    assert client.get("/me/following?follow=topic:1").status_code == 422
+    several = f"/me/following?follow=task:{t.id}&follow=method:1&topic_id=1&topic_id=2"
+    assert client.get(several).status_code == 200
     assert client.delete(f"/me/follows/task/{t.id}").status_code == 204
     assert db.get(ResearchFollow, ("bob", "task", t.id)) is not None
-    assert client.get("/me/research-email").json()["enabled"] is False
+    # The follow turned the weekly email on by default; unfollowing keeps it.
+    assert client.get("/me/research-email").json()["enabled"] is True
     assert (
         client.put("/me/research-email", json={"enabled": True}).json()["email"]
         == "alice@example.com"
@@ -412,6 +430,33 @@ def test_api_ownership_optin_and_unsubscribe(db, now, monkeypatch):
         lambda request: {"email": "spoof@example.com", "email_verified": False},
     )
     assert client.put("/me/research-email", json={"enabled": True}).status_code == 409
+
+
+def test_weekly_email_defaults_on_once_and_respects_opt_out(db, monkeypatch):
+    app = FastAPI()
+    app.include_router(research.router)
+    app.dependency_overrides[get_database_session] = lambda: db
+    user = {"hf_subject": "alice"}
+    app.dependency_overrides[require_user] = lambda: user
+    session = {"email": "Alice@example.com", "email_verified": True}
+    monkeypatch.setattr(research, "decode_request_session", lambda request: session)
+    first, second = Task(name="First"), Task(name="Second")
+    db.add_all([first, second])
+    db.flush()
+    client = TestClient(app)
+    assert client.get("/me/research-email").json()["enabled"] is False
+    assert client.put(f"/me/follows/task/{first.id}").status_code == 204
+    prefs = client.get("/me/research-email").json()
+    assert prefs["enabled"] is True and prefs["email"] == "alice@example.com"
+    assert db.get(ResearchSubscription, "alice").opted_in_at is not None
+    client.put("/me/research-email", json={"enabled": False})
+    assert client.put(f"/me/follows/task/{second.id}").status_code == 204
+    assert client.get("/me/following").status_code == 200
+    assert client.get("/me/research-email").json()["enabled"] is False
+    user["hf_subject"] = "bob"
+    session = {"email": "bob@example.com", "email_verified": False}
+    assert client.put(f"/me/follows/task/{first.id}").status_code == 204
+    assert client.get("/me/research-email").json()["enabled"] is False
 
 
 def test_retry_outbox_payload_suppression_and_expiry(db, now, monkeypatch):
@@ -598,6 +643,67 @@ def test_feed_hydrates_standard_cards_in_ranked_order(db, now, monkeypatch):
         str(older.id)
     ]
     assert follows.feed_entries(db, "bob", now, 0, 2) == []
+
+
+def test_new_paper_count_counts_feed_papers_added_since(db, now, monkeypatch):
+    task = Task(name="New count task", slug="new-count-task")
+    db.add(task)
+    db.flush()
+    seen = now - timedelta(hours=6)
+    old = paper(db, now, "count-old", days=2, created_at=now - timedelta(days=1))
+    fresh = paper(db, now, "count-new", days=1, created_at=now - timedelta(hours=1))
+    other = paper(db, now, "count-other", days=1, created_at=now - timedelta(hours=1))
+    for row in [old, fresh]:
+        tagged(db, row, task)
+    follow(db, "task", task, now - timedelta(days=3))
+    assert follows.new_paper_count(db, "alice", now, seen) == 1
+    assert follows.new_paper_count(db, "alice", now, now - timedelta(days=2)) == 2
+    assert follows.new_paper_count(db, "bob", now, seen) == 0
+    assert other.id not in {old.id, fresh.id}
+    monkeypatch.setattr(follows, "NEW_COUNT_LIMIT", 1)
+    assert follows.new_paper_count(db, "alice", now, now - timedelta(days=2)) == 1
+
+    app = FastAPI()
+    app.include_router(research.router)
+    app.dependency_overrides[get_database_session] = lambda: db
+    app.dependency_overrides[require_user] = lambda: {"hf_subject": "alice"}
+    client = TestClient(app)
+    response = client.get("/me/following/new-count", params={"since": seen.isoformat()})
+    assert response.json() == {"count": 1}
+    assert client.get("/me/following/new-count").status_code == 422
+
+
+def test_feed_lists_papers_added_since_newest_first(db, now, monkeypatch):
+    task = Task(name="Added since task", slug="added-since-task")
+    db.add(task)
+    db.flush()
+    seen = now - timedelta(hours=6)
+    old = paper(db, now, "added-old", days=2, created_at=now - timedelta(days=1))
+    fresh = paper(db, now, "added-new", days=3, created_at=now - timedelta(hours=1))
+    newest = paper(
+        db, now, "added-newest", days=5, created_at=now - timedelta(minutes=5)
+    )
+    for row in [old, fresh, newest]:
+        tagged(db, row, task)
+    follow(db, "task", task, now - timedelta(days=3))
+    from backend.services.paper_service import PaperService
+
+    monkeypatch.setattr(
+        PaperService,
+        "_resolve_thumbnail_url",
+        lambda self, row: f"/api/thumbnails/{row.id}.png",
+    )
+    entries = follows.feed_entries(db, "alice", now, 0, 10, added_after=seen)
+    assert [e.paper.id for e in entries] == [str(newest.id), str(fresh.id)]
+    assert len(entries) == follows.new_paper_count(db, "alice", now, seen)
+    assert all(e.added_at > seen for e in entries)
+    everything = follows.feed_entries(db, "alice", now, 0, 10)
+    assert {e.paper.id for e in everything} == {
+        str(old.id),
+        str(fresh.id),
+        str(newest.id),
+    }
+    assert all(e.added_at is not None for e in everything)
 
 
 def test_feed_uses_home_feed_trending_order(db, now, monkeypatch):

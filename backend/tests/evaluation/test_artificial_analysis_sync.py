@@ -816,6 +816,52 @@ def test_fetch_reports_a_few_withdrawn_reviewed_models(monkeypatch):
         )
 
 
+def test_fetch_counts_listed_unscored_models_and_withdrawn_index(monkeypatch):
+    identity = aa.PaperIdentity(arxiv_id="2608.00001")
+    reviewed = {f"reviewed-{index}": identity for index in range(8)}
+    monkeypatch.setattr(aa, "MODEL_PAPER_IDENTITIES", reviewed)
+    monkeypatch.setattr(
+        aa,
+        "INDEXES",
+        tuple(
+            replace(index, min_expected_models=1, max_expected_models=10)
+            for index in aa.INDEXES
+        ),
+    )
+    # Agentic scores are gone for everyone; half the models lost every score.
+    listed = [
+        _api_row(f"reviewed-{index}", agentic=None)
+        if index < 4
+        else _api_row(f"reviewed-{index}", intelligence=None, agentic=None)
+        for index in range(8)
+    ]
+
+    leaderboard = aa.fetch_artificial_analysis_leaderboard(
+        api_key="secret", client=_single_page_client(listed)
+    )
+    assert leaderboard.missing_reviewed == []
+    assert leaderboard.withdrawn_indexes == ["agentic"]
+    assert len(leaderboard.entries) == 4
+
+
+def test_sync_keeps_rows_of_withdrawn_index(monkeypatch):
+    calls = []
+    service = aa.ArtificialAnalysisSyncService.__new__(aa.ArtificialAnalysisSyncService)
+    service.db = _session()
+
+    def fake_sync_index(index, *_args, **_kwargs):
+        calls.append(index.key)
+        return aa.ArtificialAnalysisIndexStats()
+
+    monkeypatch.setattr(service, "_sync_index", fake_sync_index)
+    leaderboard = aa.ArtificialAnalysisLeaderboard(
+        "5", [], withdrawn_indexes=["agentic"]
+    )
+    stats = service.sync(leaderboard, discovery=aa.ArtificialAnalysisDiscovery())
+    assert calls == ["intelligence"]
+    assert "agentic" not in stats.indexes
+
+
 def test_new_index_version_retires_unlisted_older_intelligence_rows(monkeypatch):
     session = _session()
     monkeypatch.setattr(
@@ -890,3 +936,99 @@ def test_new_index_version_retires_unlisted_older_intelligence_rows(monkeypatch)
     assert stats.indexes["intelligence"].retired == 1
     assert stats.missing_upstream == ["withdrawn"]
     assert stats.to_dict()["missing_upstream"] == ["withdrawn"]
+
+
+def _identity_session() -> Session:
+    session = _session()
+    Base.metadata.create_all(
+        session.get_bind(),
+        tables=[
+            HfArtifact.__table__,
+            ModelRelease.__table__,
+            ModelReleaseArtifact.__table__,
+            ModelProviderAlias.__table__,
+        ],
+    )
+    return session
+
+
+def _paper(session: Session, title: str, *, source: str = "external") -> Paper:
+    count = session.query(Paper).count()
+    identity = (
+        {"arxiv_id": f"2609.{count:05d}"}
+        if source == "arxiv"
+        else {"source_url": f"https://example.com/release-{count}"}
+    )
+    paper = Paper(
+        title=title, source=source, version="v1", is_latest_version=True, **identity
+    )
+    session.add(paper)
+    session.flush()
+    return paper
+
+
+def test_release_name_matches_slug_spelled_with_dashes():
+    session = _identity_session()
+    paper = _paper(session, "Gemini 4 Carbon: our next frontier model")
+    session.add(
+        ModelRelease(paper_id=paper.id, canonical_name="Gemini 4 Carbon", aliases=[])
+    )
+    session.commit()
+
+    release = aa.ModelReleaseIdentityService(session).resolve(
+        "artificial-analysis", "gemini-4-carbon", name="Gemini 4 Carbon (High)"
+    )
+
+    assert release is not None and release.paper_id == paper.id
+
+
+def test_discovery_binds_base_slugs_to_launch_pages(monkeypatch):
+    session = _identity_session()
+    opus = _paper(session, "Introducing Claude Opus 5.5")
+    argon = _paper(session, "Gemini 4 Argon: our next era of frontier intelligence")
+    _paper(session, "A team of Gemini 4 Argon agents beats Minecraft", source="arxiv")
+    _paper(session, "Introducing Twin Model")
+    _paper(session, "Twin Model", source="arxiv")
+    session.commit()
+    monkeypatch.setattr(aa, "MODEL_PAPER_IDENTITIES", {})
+    entries = [
+        ("claude-opus-5-5", "Claude Opus 5.5 (Max, Default Fallback)"),
+        ("claude-opus-5-5-xhigh", "Claude Opus 5.5 (Xhigh, Default Fallback)"),
+        ("gemini-4-argon", "Gemini 4 Argon (High)"),
+        ("twin-model", "Twin Model"),
+        ("unknown-model", "Unknown Model"),
+    ]
+    leaderboard = aa.ArtificialAnalysisLeaderboard(
+        "5",
+        [
+            aa.ArtificialAnalysisEntry(
+                slug, name, {"intelligence": 50.0}, date(2026, 9, 1)
+            )
+            for slug, name in entries
+        ],
+    )
+
+    result = asyncio.run(
+        aa.ArtificialAnalysisPaperDiscoveryService(session).discover(
+            leaderboard=leaderboard
+        )
+    )
+
+    # Settings variants and ambiguous titles stay unbound.
+    assert result.papers == {"claude-opus-5-5": opus.id, "gemini-4-argon": argon.id}
+    aliases = {
+        alias.alias: alias.model_release_id
+        for alias in session.query(ModelProviderAlias).all()
+    }
+    assert set(aliases) == {"claude-opus-5-5", "gemini-4-argon"}
+    release = session.get(ModelRelease, aliases["claude-opus-5-5"])
+    assert (release.paper_id, release.canonical_name) == (opus.id, "Claude Opus 5.5")
+
+    # A second run reuses the persisted aliases.
+    again = asyncio.run(
+        aa.ArtificialAnalysisPaperDiscoveryService(session).discover(
+            leaderboard=leaderboard
+        )
+    )
+    assert again.papers == result.papers
+    assert session.query(ModelProviderAlias).count() == 2

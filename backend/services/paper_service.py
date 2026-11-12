@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, desc, asc, exists, or_, func, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend.models.database import (
     Paper as DBPaper,
@@ -70,7 +71,9 @@ from backend.utils.exceptions import (
 )
 from backend.config import get_settings
 from backend.services.paper_implementation_service import (
+    HF_ARTIFACTS_EXIST_SQL,
     family_repository_exists_clause,
+    hf_artifacts_exist_clause,
 )
 from backend.services.paper_feed_executor import PaperFeedExecutor, GENERAL_ORDERING
 from backend.services.paper_citation_refresh_service import PaperCitationRefreshService
@@ -783,10 +786,8 @@ class PaperService:
             response.applied_filters = applied_filters
             return response
 
-        except (PaperNotFoundError, AmbiguousAuthorError, InvalidAuthorFilterError):
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Error fetching papers: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Error fetching papers: {str(e)}") from e
 
     def _resolve_paper_feed_scope(
         self,
@@ -1120,9 +1121,7 @@ class PaperService:
                 )
                 for row in rows
             ]
-        except DatabaseError:
-            raise
-        except Exception as error:
+        except SQLAlchemyError as error:
             raise DatabaseError(str(error)) from error
 
     def _to_repository_trending_paper(
@@ -1194,7 +1193,7 @@ class PaperService:
     # star velocity of their best official repository. Two-step dedup: pick the
     # best official repo per paper, then keep one paper per repo (most recently
     # published) so the feed never shows duplicate repo cards.
-    _TRENDING_SQL_GITHUB = text("""
+    _TRENDING_SQL_GITHUB = text(f"""
         WITH paper_trending AS (
             SELECT DISTINCT ON (p.id)
                 p.id as paper_id,
@@ -1236,10 +1235,7 @@ class PaperService:
                         OR (p.arxiv_id IS NULL AND family.id = p.id)
                       )
                 ))
-                AND (:has_hf_artifacts = FALSE OR EXISTS (
-                    SELECT 1 FROM paper_hf_artifacts artifact_link
-                    WHERE artifact_link.paper_id = p.id
-                ))
+                AND (:has_hf_artifacts = FALSE OR {HF_ARTIFACTS_EXIST_SQL})
             ORDER BY p.id, r.trending_score DESC NULLS LAST, r.num_stars DESC NULLS LAST
         ),
         ranked_by_repo AS (
@@ -1267,7 +1263,7 @@ class PaperService:
     # cron. Papers with HF-only signal have a NULL repository_id and are NOT deduped
     # together (the `repository_id IS NULL` branch keeps every one of them); papers
     # sharing the same official repo are still deduped to the most recent paper.
-    _TRENDING_SQL_COMPOSITE = text("""
+    _TRENDING_SQL_COMPOSITE = text(f"""
         WITH paper_pool AS (
             SELECT DISTINCT ON (p.id)
                 p.id as paper_id,
@@ -1308,10 +1304,7 @@ class PaperService:
                         OR (p.arxiv_id IS NULL AND family.id = p.id)
                       )
                 ))
-                AND (:has_hf_artifacts = FALSE OR EXISTS (
-                    SELECT 1 FROM paper_hf_artifacts artifact_link
-                    WHERE artifact_link.paper_id = p.id
-                ))
+                AND (:has_hf_artifacts = FALSE OR {HF_ARTIFACTS_EXIST_SQL})
             ORDER BY p.id, r.num_stars DESC NULLS LAST
         ),
         ranked_by_repo AS (
@@ -1455,8 +1448,8 @@ class PaperService:
                 include_resources=include_resources,
             )
 
-        except Exception as e:
-            raise DatabaseError(f"Error fetching trending papers: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Error fetching trending papers: {str(e)}") from e
 
     def apply_scoped_trending_order(self, query):
         """Order an existing ``DBPaper`` query by the active trending metric.
@@ -1495,7 +1488,7 @@ class PaperService:
     @staticmethod
     def apply_has_hf_artifacts_filter(query):
         """Keep papers with at least one linked Hugging Face artifact."""
-        return query.filter(DBPaper.hf_artifacts.any())
+        return query.filter(hf_artifacts_exist_clause())
 
     def get_paper_versions(self, arxiv_id: str) -> PaperVersions:
         """
@@ -1770,8 +1763,8 @@ class PaperService:
 
             return self._convert_db_papers_to_summaries(db_papers)
 
-        except Exception as e:
-            raise DatabaseError(f"Error fetching recent papers: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Error fetching recent papers: {str(e)}") from e
 
     def get_paper_stats(self) -> Dict[str, Any]:
         """
@@ -1819,8 +1812,8 @@ class PaperService:
                 else None,
             }
 
-        except Exception as e:
-            raise DatabaseError(f"Error fetching paper statistics: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Error fetching paper statistics: {str(e)}") from e
 
     async def update_citation_counts(self, limit: int = 100) -> Dict[str, Any]:
         return await PaperCitationRefreshService(self.db).update_citation_counts(limit)

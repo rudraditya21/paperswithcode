@@ -6,17 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   getAvailability: vi.fn(),
   getPaperWebMarkdown: vi.fn(),
+  getPaperWebPage: vi.fn(),
   showArtifact: false,
   paper: {} as Record<string, unknown>,
 }));
 
-vi.mock("@/hooks/usePapers", () => ({
-  usePaper: () => ({
-    data: mocks.paper,
-    isLoading: false,
-    error: null,
-  }),
-}));
+
 
 const arxivPaper = {
       id: "42",
@@ -37,6 +32,7 @@ const arxivPaper = {
 vi.mock("@/lib/api/papers", async (importOriginal) => ({
   ...await importOriginal<typeof import("@/lib/api/papers")>(),
   getPaperWebMarkdown: mocks.getPaperWebMarkdown,
+  getPaperWebPage: mocks.getPaperWebPage,
 }));
 vi.mock("@/lib/api/chat", () => ({
   chatApi: { getAvailability: mocks.getAvailability },
@@ -103,6 +99,8 @@ import type { Paper } from "@/lib/api/papers.types";
 
 function renderReader(route = "/pdf/1706.03762") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  // The reader shows whichever paper the test set up, under any route ID.
+  client.setQueryDefaults(["paper"], { initialData: () => mocks.paper });
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[route]}>
@@ -119,6 +117,7 @@ describe("PaperReaderView", () => {
     vi.stubEnv("VITE_PAPER_READER_CHAT_ENABLED", "1");
     mocks.showArtifact = false;
     mocks.paper = arxivPaper;
+    mocks.getPaperWebPage.mockResolvedValue({ url: "", frameable: false });
     mocks.getAvailability.mockResolvedValue({
       status: "available",
       reason: null,
@@ -226,6 +225,99 @@ describe("PaperReaderView", () => {
     expect(mocks.getPaperWebMarkdown).toHaveBeenCalledWith("123294");
     fireEvent.click(screen.getByRole("tab", { name: "Chat" }));
     expect(screen.getByText("Paper chat")).toBeVisible();
+  });
+
+  it("shows a GitHub Pages paper's original page and switches to its Markdown text", async () => {
+    mocks.getPaperWebMarkdown.mockResolvedValue("# Sparks of Weight-Space Programming\n\nAstra reads weights.\n");
+    mocks.paper = {
+      id: "131739",
+      arxiv_id: null,
+      title: "Sparks of Weight-Space Programming",
+      source: "external",
+      version: "v1",
+      source_url: "https://rikiyat.github.io/blog/weight-space-programming/",
+      url_pdf: null,
+      repositories: [],
+      project_pages: [],
+    };
+
+    renderReader("/pdf/131739");
+
+    const frame = await screen.findByTitle("Original page: Sparks of Weight-Space Programming");
+    expect(frame.tagName).toBe("IFRAME");
+    expect(frame).toHaveAttribute("src", "https://rikiyat.github.io/blog/weight-space-programming/");
+    expect(frame.getAttribute("sandbox")).not.toContain("allow-top-navigation");
+    expect(screen.getByRole("button", { name: "Original" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("link", { name: "Open original" }))
+      .toHaveAttribute("href", "https://rikiyat.github.io/blog/weight-space-programming/");
+
+    fireEvent.click(screen.getByRole("button", { name: "Text" }));
+
+    expect(await screen.findByText("Astra reads weights.")).toBeVisible();
+    expect(screen.queryByTitle("Original page: Sparks of Weight-Space Programming")).not.toBeInTheDocument();
+  });
+
+  it("drops Open original when the project page is the same page", async () => {
+    mocks.getPaperWebMarkdown.mockResolvedValue("# Sparks\n\nAstra reads weights.\n");
+    mocks.paper = {
+      id: "131739",
+      arxiv_id: null,
+      title: "Sparks of Weight-Space Programming",
+      source: "external",
+      version: "v1",
+      source_url: "https://rikiyat.github.io/blog/weight-space-programming/",
+      url_pdf: null,
+      repositories: [],
+      project_pages: [{ url: "http://www.rikiyat.github.io/blog/weight-space-programming", is_official: true }],
+    };
+
+    renderReader("/pdf/131739");
+
+    expect(await screen.findByRole("link", { name: "Open project page at rikiyat.github.io" }))
+      .toHaveAttribute("href", "http://www.rikiyat.github.io/blog/weight-space-programming");
+    expect(screen.queryByRole("link", { name: "Open original" })).not.toBeInTheDocument();
+  });
+
+  it("frames other web papers only once the server's header check allowed them", async () => {
+    mocks.getPaperWebMarkdown.mockResolvedValue("# GLM-4.7\n\nA coding model.\n");
+    mocks.getPaperWebPage.mockResolvedValue({ url: "https://z.ai/blog/glm-4.7", frameable: true });
+    mocks.paper = {
+      id: "130001",
+      arxiv_id: null,
+      title: "GLM-4.7",
+      source: "external",
+      version: "v1",
+      source_url: "https://z.ai/blog/glm-4.7",
+      url_pdf: null,
+      repositories: [],
+      project_pages: [],
+    };
+
+    renderReader("/pdf/130001");
+
+    expect(await screen.findByTitle("Original page: GLM-4.7")).toHaveAttribute("src", "https://z.ai/blog/glm-4.7");
+    expect(mocks.getPaperWebPage).toHaveBeenCalledWith("130001");
+  });
+
+  it("reads a web paper as Markdown when its framing check fails", async () => {
+    mocks.getPaperWebMarkdown.mockResolvedValue("# GLM-4.7\n\nA coding model.\n");
+    mocks.getPaperWebPage.mockRejectedValue(new Error("storage unavailable"));
+    mocks.paper = {
+      id: "130001",
+      arxiv_id: null,
+      title: "GLM-4.7",
+      source: "external",
+      version: "v1",
+      source_url: "https://z.ai/blog/glm-4.7",
+      url_pdf: null,
+      repositories: [],
+      project_pages: [],
+    };
+
+    renderReader("/pdf/130001");
+
+    expect(await screen.findByText("A coding model.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Original" })).not.toBeInTheDocument();
   });
 
   it("only accepts an official GitHub repository for the title action", () => {

@@ -11,6 +11,7 @@ import time
 from typing import Optional, List
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, asc, case
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend.models.database import (
     Task as DBTask,
@@ -79,6 +80,16 @@ class TaskService:
             self.get_task_by_id if identifier.isdigit() else self.get_task_by_slug
         )
         return operation(identifier)
+
+    def _require_db_task(self, identifier: str) -> DBTask:
+        """Resolve a task by numeric id or slug, raising when it does not exist."""
+        if str(identifier).isdigit():
+            db_task = self.db.query(DBTask).filter(DBTask.id == int(identifier)).first()
+        else:
+            db_task = self._get_db_task_by_slug(str(identifier))
+        if db_task is None:
+            raise PaperNotFoundError(f"Task '{identifier}' not found")
+        return db_task
 
     def _get_db_task_by_slug(self, slug: str) -> Optional[DBTask]:
         for candidate in task_slug_candidates(slug):
@@ -150,8 +161,8 @@ class TaskService:
                 self._build_task_model(db_task, int(paper_count or 0))
                 for db_task, paper_count in results
             ]
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve top tasks: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve top tasks: {str(e)}") from e
 
     def get_tasks(
         self,
@@ -305,8 +316,8 @@ class TaskService:
                 results=tasks,
             )
 
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve tasks: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve tasks: {str(e)}") from e
 
     def get_trending_tasks(
         self,
@@ -416,8 +427,8 @@ class TaskService:
                 baseline_days=baseline_days,
             )
 
-        except Exception as e:
-            raise DatabaseError(f"Failed to compute trending tasks: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to compute trending tasks: {str(e)}") from e
 
     def get_task_by_id(self, task_id: str) -> Task:
         """
@@ -449,10 +460,8 @@ class TaskService:
 
             return self._build_task_model(db_task, paper_count)
 
-        except PaperNotFoundError:
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve task: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve task: {str(e)}") from e
 
     def get_task_by_slug(self, slug: str) -> Task:
         """
@@ -476,10 +485,8 @@ class TaskService:
 
             return self.get_task_by_id(str(db_task.id))
 
-        except PaperNotFoundError:
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve task: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve task: {str(e)}") from e
 
     def get_task_children(
         self,
@@ -501,27 +508,14 @@ class TaskService:
             PaperNotFoundError: If parent task not found
             DatabaseError: If database query fails
         """
-        try:
-            # Verify parent task exists
-            parent_task = (
-                self.db.query(DBTask).filter(DBTask.id == int(task_id)).first()
-            )
-            if not parent_task:
-                raise PaperNotFoundError(f"Task with ID {task_id} not found")
-
-            # Get children
-            return self.get_tasks(
-                page=page,
-                page_size=page_size,
-                parent_id=int(task_id),
-                order_by="name",
-                order_dir="asc",
-            )
-
-        except PaperNotFoundError:
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve child tasks: {str(e)}")
+        parent_task = self._require_db_task(task_id)
+        return self.get_tasks(
+            page=page,
+            page_size=page_size,
+            parent_id=parent_task.id,
+            order_by="name",
+            order_dir="asc",
+        )
 
     def get_task_parents(self, task_id: str) -> List[Task]:
         """
@@ -537,11 +531,8 @@ class TaskService:
             PaperNotFoundError: If task not found
             DatabaseError: If database query fails
         """
+        db_task = self._require_db_task(task_id)
         try:
-            db_task = self.db.query(DBTask).filter(DBTask.id == int(task_id)).first()
-            if not db_task:
-                raise PaperNotFoundError(f"Task with ID {task_id} not found")
-
             parents = []
             current = db_task
 
@@ -566,10 +557,8 @@ class TaskService:
 
             return parents
 
-        except PaperNotFoundError:
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve parent tasks: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve parent tasks: {str(e)}") from e
 
     def get_task_sisters(self, task_id: str) -> List[Task]:
         """
@@ -608,8 +597,8 @@ class TaskService:
                 for db_task, paper_count, _ in rows
             ]
 
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve sister tasks: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve sister tasks: {str(e)}") from e
 
     def get_task_recommended_frameworks(
         self, task_id: str
@@ -647,8 +636,10 @@ class TaskService:
                 )
                 for repository, framework in rows
             ]
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve recommended frameworks: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(
+                f"Failed to retrieve recommended frameworks: {str(e)}"
+            ) from e
 
     def get_task_page(
         self,
@@ -763,8 +754,8 @@ class TaskService:
             raise
         except ValueError as error:
             raise CatalogValidationError("Invalid area ID format") from error
-        except Exception as e:
-            raise DatabaseError(f"Failed to retrieve tasks for area: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to retrieve tasks for area: {str(e)}") from e
 
     def search_tasks(
         self,
@@ -1068,10 +1059,8 @@ class TaskService:
                 repository_limit=repository_limit,
             )
 
-        except PaperNotFoundError:
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to get papers for task: {str(e)}")
+        except SQLAlchemyError as e:
+            raise DatabaseError(f"Failed to get papers for task: {str(e)}") from e
 
     def add_keywords(self, task_id: str, keywords: List[str]) -> Task:
         """
@@ -1122,7 +1111,7 @@ class TaskService:
             raise
         except Exception as e:
             self.db.rollback()
-            raise DatabaseError(f"Failed to add keywords to task: {str(e)}")
+            raise DatabaseError(f"Failed to add keywords to task: {str(e)}") from e
 
     def remove_keywords(self, task_id: str, keywords: List[str]) -> Task:
         """
@@ -1173,7 +1162,7 @@ class TaskService:
             raise
         except Exception as e:
             self.db.rollback()
-            raise DatabaseError(f"Failed to remove keywords from task: {str(e)}")
+            raise DatabaseError(f"Failed to remove keywords from task: {str(e)}") from e
 
     def replace_keywords(self, task_id: str, keywords: List[str]) -> Task:
         """
@@ -1214,7 +1203,7 @@ class TaskService:
             raise
         except Exception as e:
             self.db.rollback()
-            raise DatabaseError(f"Failed to replace keywords for task: {str(e)}")
+            raise DatabaseError(f"Failed to replace keywords for task: {str(e)}") from e
 
     def create_task(self, request: TaskCreateRequest, *, commit: bool = True) -> Task:
         """

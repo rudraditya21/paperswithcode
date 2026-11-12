@@ -123,6 +123,18 @@ async def lifespan(app: FastAPI):
     print(f"🌍 Environment: {settings.environment}")
     print(f"📦 Release: {settings.release_id}")
     validate_runtime(settings)
+    if settings.is_deployed:
+        from backend.services.chat_config_expiry import expiring_chat_config
+
+        now = datetime.now(UTC)
+        for expiry in expiring_chat_config(settings, now):
+            logging.getLogger(__name__).warning(
+                "chat configuration %s expires at %s (%s remaining); renew %s",
+                expiry.name,
+                expiry.expires_at.isoformat(),
+                expiry.remaining(now),
+                expiry.renewal,
+            )
     if settings.chat_enabled and not settings.chat_require_auth:
         raise RuntimeError("PWC_CHAT_REQUIRE_AUTH must remain enabled")
 
@@ -352,6 +364,12 @@ async def lifespan(app: FastAPI):
         pool_startup_task = asyncio.create_task(replenish_pool_at_startup())
         maintenance_task = asyncio.create_task(maintain_sandboxes())
 
+    if settings.is_deployed:
+        from backend.database.connection import db_manager
+        from backend.services.organization_service import warm_organization_index
+
+        warm_organization_index(db_manager.engine)
+
     async with AsyncExitStack() as gateway_stack:
         if settings.chat_enabled and settings.chat_pwc_mcp_enabled:
             from backend.chat_gateway_app import (
@@ -515,6 +533,7 @@ def create_app() -> FastAPI:
         contributions,
         cron,
         datasets,
+        dictation,
         evaluations,
         external_resources,
         frameworks,
@@ -578,6 +597,8 @@ def create_app() -> FastAPI:
     app.include_router(stats.router, prefix="/api/v1", tags=["stats"])
     if settings.chat_enabled:
         app.include_router(chat.router, prefix="/api/v1", tags=["chat"])
+        app.include_router(dictation.router, prefix="/api/v1")
+        app.include_router(dictation.internal_router, prefix="/api")
         from backend.chat_gateway_app import app as chat_gateway_app
 
         app.mount("/api/internal/chat-gateway", chat_gateway_app)

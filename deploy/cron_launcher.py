@@ -41,6 +41,8 @@ RESTRICTED_TRENDING_PASSTHROUGH_KEYS = frozenset(
         "PWC_DB_PORT",
         "PWC_TRENDING_PIN_ARXIV_IDS",
         "PWC_TRENDING_PIN_PAPER_IDS",
+        "PWC_TRENDING_X_MIN_LIKES_PER_HOUR",
+        "PWC_TRENDING_X_WEIGHT",
         "TZ",
     }
 )
@@ -339,26 +341,6 @@ COMMANDS: dict[str, Job] = {
             "from the official API"
         ),
     ),
-    "sync_mmteb_retrieval": job(
-        "-m",
-        "scripts.hourly.sync_mmteb",
-        "retrieval",
-        timeout="30m",
-        idempotency=(
-            "replace arXiv-backed managed MMTEB v2 retrieval evaluation rows "
-            "from the official API"
-        ),
-    ),
-    "sync_mmteb_reranking": job(
-        "-m",
-        "scripts.hourly.sync_mmteb",
-        "reranking",
-        timeout="30m",
-        idempotency=(
-            "replace arXiv-backed managed MMTEB v2 reranking evaluation rows "
-            "from the official API"
-        ),
-    ),
     "sync_mmeb_v2": job(
         "-m",
         "scripts.hourly.sync_mmeb",
@@ -443,6 +425,24 @@ COMMANDS: dict[str, Job] = {
             "from the validated Surge AI leaderboard; never creates papers"
         ),
     ),
+    "sync_swe_marathon": job(
+        "-m",
+        "scripts.hourly.sync_swe_marathon",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed SWE-Marathon v1.1 evaluation rows from the "
+            "validated swe-marathon.org results bundle; never creates papers"
+        ),
+    ),
+    "sync_jevbench": job(
+        "-m",
+        "scripts.hourly.sync_jevbench",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed JevBench evaluation rows from Benchmark "
+            "Heaven's validated API board; never creates papers"
+        ),
+    ),
     "sync_frontiercs_2": job(
         "-m",
         "scripts.hourly.sync_frontiercs_2",
@@ -450,6 +450,114 @@ COMMANDS: dict[str, Job] = {
         idempotency=(
             "create or revise reviewed FrontierCS 2 evaluation rows from the "
             "validated frontier-cs.org leaderboard data; never creates papers"
+        ),
+    ),
+    "sync_vals_index": job(
+        "-m",
+        "scripts.hourly.sync_vals_index",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed Vals Index evaluation rows from the "
+            "validated official leaderboard; never creates papers"
+        ),
+    ),
+    "sync_swe_sweep": job(
+        "-m",
+        "scripts.hourly.sync_swe_sweep",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed SWE-sweep evaluation rows from the "
+            "validated official leaderboard; never creates papers"
+        ),
+    ),
+    "sync_vending_bench_2": job(
+        "-m",
+        "scripts.hourly.sync_vending_bench_2",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed Vending-Bench 2 evaluation rows from the "
+            "validated official leaderboard; never creates papers"
+        ),
+    ),
+    "sync_blueprint_bench_2": job(
+        "-m",
+        "scripts.hourly.sync_blueprint_bench_2",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed Blueprint-Bench 2 evaluation rows from the "
+            "validated official leaderboard; never creates papers"
+        ),
+    ),
+    "sync_riemann_bench": job(
+        "-m",
+        "scripts.hourly.sync_riemann_bench",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed Riemann-Bench evaluation rows from the "
+            "validated official leaderboard; never creates papers"
+        ),
+    ),
+    "sync_cwe_bench": job(
+        "-m",
+        "scripts.hourly.sync_cwe_bench",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed CWE-bench evaluation rows from the "
+            "validated official leaderboard; never creates papers"
+        ),
+    ),
+    "sync_exploitgym": job(
+        "-m",
+        "scripts.hourly.sync_exploitgym",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed ExploitGym evaluation rows from the "
+            "validated official leaderboard; never creates papers"
+        ),
+    ),
+    "sync_cybergym": job(
+        "-m",
+        "scripts.hourly.sync_cybergym",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed CyberGym evaluation rows from the "
+            "validated official leaderboard; never creates papers"
+        ),
+    ),
+    "sync_patcheval_verified": job(
+        "-m",
+        "scripts.hourly.sync_patcheval_verified",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed PatchEval-Verified evaluation rows from the "
+            "validated official leaderboard; never creates papers"
+        ),
+    ),
+    "sync_critpt": job(
+        "-m",
+        "scripts.hourly.sync_critpt",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed CritPt evaluation rows from the validated "
+            "Artificial Analysis evaluation page; never creates papers"
+        ),
+    ),
+    "sync_critpt_v2": job(
+        "-m",
+        "scripts.hourly.sync_critpt_v2",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed CritPt v2 evaluation rows from the validated "
+            "Artificial Analysis evaluation page; never creates papers"
+        ),
+    ),
+    "sync_terminal_bench_science": job(
+        "-m",
+        "scripts.hourly.sync_terminal_bench_science",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed Terminal-Bench-Science evaluation rows from the "
+            "validated Artificial Analysis evaluation page; never creates papers"
         ),
     ),
     "sync_physics_iq_verified": job(
@@ -506,7 +614,8 @@ COMMANDS: dict[str, Job] = {
         timeout="30m",
         idempotency=(
             "queue at most one daily overseer review of eligible benchmark-gap "
-            "candidates and at most 40 add-benchmark jobs per UTC day"
+            "candidates and at most 40 add-benchmark jobs per UTC day, then at "
+            "most one add-evals re-check per paper and new benchmark (20 per run)"
         ),
     ),
     "scan_model_releases": job(
@@ -529,23 +638,24 @@ COMMANDS: dict[str, Job] = {
             "section"
         ),
     ),
-    "post_trending_paper_to_x": job(
+    "refresh_x_post_likes": job(
         "-m",
-        "backend.scripts.post_trending_paper_to_x",
+        "backend.scripts.refresh_x_post_likes",
         timeout="30m",
         idempotency=(
-            "post at most one never-posted trending paper per run; paper_x_posts "
-            "is written right after the post, so a paper is never posted twice"
+            "read each due post once per run and write only x_post_metrics; "
+            "report-only rolls back unless PWC_X_LIKES_APPLY=true"
         ),
     ),
-    "post_x_insight": job(
+    "x_post_candidates": job(
         "-m",
-        "backend.scripts.post_x_insight",
+        "backend.scripts.x_post_candidates",
         timeout="30m",
         idempotency=(
-            "post at most one insight per run; x_insight_posts is written right "
-            "after the post, so a subject is never posted twice"
+            "list is read-only; record inserts one x_insight_posts row per "
+            "posted subject, called once by the X agent after each post"
         ),
+        health_job="x_post_candidates",
     ),
     "link_abstract_mentions": job(
         "-m",

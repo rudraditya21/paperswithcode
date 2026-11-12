@@ -3,6 +3,7 @@ import type { HuggingFaceRepoCounts } from "@/hooks/useHuggingFaceRepos";
 import { copyableLeaderboardRanks } from "./leaderboardBadges";
 import { safeExternalHref } from "./safeExternalHref";
 import { summarizeRepos } from "./transform";
+import { stripArxivVersion } from "./utils";
 
 export interface HuggingFaceArtifactsViewer {
   isLoading: boolean;
@@ -17,11 +18,14 @@ export interface HuggingFaceArtifactsViewer {
   footer: string | null;
 }
 
+// Label Hub links by their repo id ("owner/name"): mirrors and demos often
+// reuse the official repo name, so the name alone reads like a duplicate.
 function resourceLabel(url: string, fallback: string): string {
   try {
     const parsed = new URL(url);
-    const slug = parsed.pathname.replace(/\/$/, "").split("/").filter(Boolean).at(-1);
-    return slug?.replace(/[-_]+/g, " ") || parsed.hostname.replace(/^www\./, "");
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    if (segments[0] === "datasets" || segments[0] === "spaces") segments.shift();
+    return segments.slice(0, 2).join("/") || parsed.hostname.replace(/^www\./, "");
   } catch {
     return fallback;
   }
@@ -122,7 +126,7 @@ export function buildPaperDetailPresentation(
     datasets: links.datasets.map(({ href }) => href),
     spaces: links.spaces.map(({ href }) => href),
   };
-  const canonicalArxivId = paper.arxiv_id?.replace(/v\d+$/, "") ?? null;
+  const canonicalArxivId = paper.arxiv_id != null ? stripArxivVersion(paper.arxiv_id) : null;
   const hfArtifactViewer: HuggingFaceArtifactsViewer = paper.arxiv_id
     ? {
         isLoading: hfLoading,

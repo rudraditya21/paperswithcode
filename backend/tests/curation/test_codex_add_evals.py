@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from httpx import Request, Response
 from huggingface_hub.errors import HfHubHTTPError
@@ -119,6 +120,16 @@ def test_curator_bootstrap_allowlist_matches_service_bundle(monkeypatch):
     run_paper_curation = importlib.import_module("jobs.run_paper_curation")
 
     assert run_paper_curation.BOOTSTRAP_PATHS == set(CURATOR_BOOTSTRAP_PATHS)
+
+
+@pytest.fixture(autouse=True)
+def _no_removed_leaderboards(monkeypatch):
+    # These fake sessions do not model the tombstone aggregate query.
+    monkeypatch.setattr(
+        "backend.services.codex_curation_callback_service."
+        "CodexCurationCallbackService._removed_leaderboards",
+        lambda _self, _paper_id: {},
+    )
 
 
 @pytest.fixture
@@ -714,6 +725,9 @@ def test_scoped_worker_can_apply_discovered_evaluation(monkeypatch):
         def __init__(self, _db):
             pass
 
+        def find_leaderboard_duplicate(self, **_identity):
+            return None
+
         def create_evaluation(self, **values):
             created.append(values)
 
@@ -1068,3 +1082,32 @@ def test_polled_reads_share_one_reconcile_per_interval(monkeypatch):
     service.reconcile_if_due(None, None)
 
     assert len(calls) == 2
+
+
+def test_leaderboard_lookups_have_a_larger_budget_than_taxonomy():
+    from backend.routers import codex_curation_callbacks
+
+    class Session:
+        def refresh(self, *_args, **_kwargs):
+            pass
+
+        def rollback(self):
+            pass
+
+        def commit(self):
+            pass
+
+    row = SimpleNamespace(taxonomy_query_count=30, leaderboard_query_count=30)
+
+    codex_curation_callbacks._consume_query(Session(), row, "leaderboard_query_count")
+    assert row.leaderboard_query_count == 31
+
+    with pytest.raises(HTTPException) as taxonomy_limit:
+        codex_curation_callbacks._consume_query(Session(), row, "taxonomy_query_count")
+    assert taxonomy_limit.value.status_code == 429
+
+    row.leaderboard_query_count = 150
+    with pytest.raises(HTTPException):
+        codex_curation_callbacks._consume_query(
+            Session(), row, "leaderboard_query_count"
+        )

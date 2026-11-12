@@ -258,6 +258,7 @@ def _external_pdf_service() -> ThumbnailService:
     service = ThumbnailService.__new__(ThumbnailService)
     service.max_pdf_size = 1_000_000
     service.pdf_timeout = 10
+    service._read_archived_external_pdf = MagicMock(return_value=None)
     return service
 
 
@@ -266,6 +267,7 @@ def _external_pdf_service() -> ThumbnailService:
     [
         "aixiv.science",
         "ecmlpkdd-storage.s3.eu-central-1.amazonaws.com",
+        "media.eventhosts.cc",
         "microsoft.ai",
         "www.cv-foundation.org",
     ],
@@ -285,6 +287,63 @@ def test_approved_external_pdf_host_can_be_rendered(monkeypatch, host: str):
     result = asyncio.run(service._download_external_pdf(f"https://{host}/report.pdf"))
 
     assert result == b"%PDF-example"
+
+
+def test_huggingface_pdf_follows_cdn_redirect(monkeypatch):
+    service = _external_pdf_service()
+    cdn_url = "https://us.aws.cdn.hf.co/xet-bridge-us/abc?Signature=x"
+    hops = []
+
+    async def fetch_one_hop(url, **kwargs):
+        hops.append(url)
+        if url == cdn_url:
+            return 200, "application/pdf", b"%PDF-example", None
+        return 302, "text/plain", b"", cdn_url
+
+    monkeypatch.setattr(
+        "backend.services.safe_outbound_http_service._fetch_one_hop", fetch_one_hop
+    )
+
+    result = asyncio.run(
+        service._download_external_pdf(
+            "https://huggingface.co/spaces/lab/publications/resolve/main/report.pdf"
+        )
+    )
+
+    assert result == b"%PDF-example"
+    assert hops[-1] == cdn_url
+
+
+@pytest.mark.parametrize(
+    ("content_type", "body", "expected"),
+    [
+        ("application/octet-stream", b"%PDF-example", b"%PDF-example"),
+        ("binary/octet-stream", b"%PDF-example", b"%PDF-example"),
+        ("application/octet-stream", b"PK\x03\x04zip", None),
+    ],
+)
+def test_generic_binary_external_pdf_is_checked_by_magic_bytes(
+    monkeypatch, content_type: str, body: bytes, expected: bytes | None
+):
+    # raw.githubusercontent.com serves repository PDFs as octet-stream.
+    service = _external_pdf_service()
+
+    async def fetch(url, **kwargs):
+        if content_type not in kwargs["allowed_content_types"]:
+            raise SafeOutboundHttpError(415, "The outbound content type is not allowed")
+        return SafeFetchResult(url, 200, content_type, body)
+
+    monkeypatch.setattr(
+        "backend.services.thumbnail_service.fetch_public_resource", fetch
+    )
+
+    result = asyncio.run(
+        service._download_external_pdf(
+            "https://github.com/microsoft/Mage/blob/main/assets/report.pdf"
+        )
+    )
+
+    assert result == expected
 
 
 @pytest.mark.parametrize("origin_status_code", [403, 404, 410])
@@ -423,6 +482,84 @@ def test_transient_pdf_url_error_falls_back_to_source_pdf(tmp_path: Path, monkey
     )
 
     service._convert_pdf_to_thumbnail.assert_called_once_with(b"%PDF-source")
+
+
+def test_external_thumbnail_uses_archived_pdf_when_source_is_gone(
+    tmp_path: Path, monkeypatch
+):
+    # Upstream deleted the branch holding the PDF after the paper was indexed.
+    service = _external_generation_service(tmp_path)
+    service._read_archived_external_pdf = MagicMock(return_value=b"%PDF-archived")
+
+    async def gone(*_args, **_kwargs):
+        raise SafeOutboundHttpError(
+            502, "The outbound origin returned an error", origin_status_code=404
+        )
+
+    monkeypatch.setattr(
+        "backend.services.thumbnail_service.fetch_public_resource", gone
+    )
+
+    asyncio.run(
+        service.generate_external_thumbnail(
+            42,
+            "https://github.com/baidu/Unlimited-OCR/blob/deleted/report.pdf",
+            title="Unlimited OCR Works 2",
+        )
+    )
+
+    service._read_archived_external_pdf.assert_called_once_with(42)
+    service._convert_pdf_to_thumbnail.assert_called_once_with(b"%PDF-archived")
+    service._render_external_metadata_thumbnail.assert_not_called()
+
+
+def test_external_thumbnail_prefers_live_pdf_over_archive(tmp_path: Path, monkeypatch):
+    service = _external_generation_service(tmp_path)
+
+    async def fetch(url, **_kwargs):
+        return SimpleNamespace(body=b"%PDF-live")
+
+    monkeypatch.setattr(
+        "backend.services.thumbnail_service.fetch_public_resource", fetch
+    )
+
+    asyncio.run(
+        service.generate_external_thumbnail(
+            42, "https://github.com/o/r/blob/main/report.pdf", title="Report"
+        )
+    )
+
+    service._read_archived_external_pdf.assert_not_called()
+    service._convert_pdf_to_thumbnail.assert_called_once_with(b"%PDF-live")
+
+
+@pytest.mark.parametrize(
+    ("archive", "expected"),
+    [
+        (ValueError("Paper PDF was not found"), None),
+        (([b"%PDF-", b"body"], 9), b"%PDF-body"),
+        (([b"%PDF-"], 2_000_000), None),
+    ],
+)
+def test_read_archived_external_pdf(monkeypatch, archive, expected):
+    service = ThumbnailService.__new__(ThumbnailService)
+    service.max_pdf_size = 1_000_000
+    service.settings = SimpleNamespace(
+        paper_markdown_hf_bucket_id="org/bucket", hf_token="token"
+    )
+
+    def stream(paper_id, *, bucket_id, token):
+        assert (paper_id, bucket_id, token) == ("42", "org/bucket", "token")
+        if isinstance(archive, Exception):
+            raise archive
+        chunks, size = archive
+        return iter(chunks), size
+
+    monkeypatch.setattr(
+        "backend.services.thumbnail_service.stream_external_paper_pdf", stream
+    )
+
+    assert service._read_archived_external_pdf(42) == expected
 
 
 def test_transient_pdf_url_error_does_not_cache_metadata_card(

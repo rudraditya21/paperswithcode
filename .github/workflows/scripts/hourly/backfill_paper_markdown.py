@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import pymupdf
-from huggingface_hub import HfApi, HfFileSystem, Volume
+from huggingface_hub import HfApi, Volume
 from huggingface_hub.errors import HfHubHTTPError
 from sqlalchemy import exists, or_, select
 
@@ -30,10 +30,15 @@ from backend.scripts.generate_missing_paper_markdown import (
 from backend.services.external_page_markdown_service import (
     ExternalPageMarkdownError,
     external_page_url,
+    framing_due,
     prepare_external_page_markdown,
+    record_page_framing,
     retry_due,
+)
+from backend.services.external_page_markdown_service import (
     status_key as external_page_status_key,
 )
+from backend.services.hf_bucket_filesystem import BucketFileSystem
 from backend.services.paper_markdown_budget_service import (
     paper_markdown_budget_snapshot,
 )
@@ -76,6 +81,9 @@ EXTERNAL_PDF_ARCHIVE_TIMEOUT_SECONDS = 30
 # Firecrawl scrapes per invocation; the live and full lanes each run hourly.
 EXTERNAL_PAGE_SCRAPE_LIMIT = 20
 EXTERNAL_PAGE_SCRAPE_TIMEOUT_SECONDS = 60
+# Header-only framing checks per invocation, so the reader can show pages that
+# allow it as themselves.
+EXTERNAL_PAGE_FRAME_CHECK_LIMIT = 60
 PROBE_SCRIPT = (
     Path(__file__).resolve().parents[4]
     / "backend"
@@ -244,6 +252,16 @@ def status_disposition(
         and status.get("version_fallback_attempted") is not True
     ):
         return "retryable_due"
+    # Before the Git LFS URL fix, GitHub-hosted PDFs resolved to the LFS pointer
+    # and failed as a permanent invalid_pdf. Re-admit those records once; the
+    # corrected archiver and worker record that they used the fixed resolver.
+    if (
+        state == "failed"
+        and status.get("source") == "external"
+        and status.get("error_class") == "invalid_pdf"
+        and status.get("lfs_pdf_url_attempted") is not True
+    ):
+        return "retryable_due"
     if status.get("retryable") is not True:
         return "permanent_failure"
     retry_at = status.get("next_retry_at")
@@ -311,7 +329,7 @@ class PaperMarkdownBackfillJob(CronJobBase):
         self.paid_authorization_required = False
         self.stalled_scheduling_jobs = 0
         self.api = HfApi(token=self.settings.hf_token or None)
-        self.filesystem = HfFileSystem(token=self.settings.hf_token or None)
+        self.filesystem = BucketFileSystem(token=self.settings.hf_token or None)
 
     @property
     def mode(self) -> str:
@@ -402,7 +420,7 @@ class PaperMarkdownBackfillJob(CronJobBase):
             if paper_markdown_bucket_key(paper_id, source="external") not in existing
         ]
         statuses = self._status_records(
-            [external_page_status_key(paper_id) for paper_id in missing]
+            [external_page_status_key(paper_id) for paper_id in pages]
         )
         due = [
             paper_id
@@ -410,16 +428,38 @@ class PaperMarkdownBackfillJob(CronJobBase):
             if retry_due(statuses.get(external_page_status_key(paper_id), {}))
         ]
         selected = due[:EXTERNAL_PAGE_SCRAPE_LIMIT]
+        framing = [
+            paper_id
+            for paper_id in pages
+            if framing_due(
+                statuses.get(external_page_status_key(paper_id), {}),
+                pages[paper_id][1],
+            )
+        ]
         counts = {
             "external_pages_eligible": len(pages),
             "external_pages_missing": len(missing),
             "external_pages_due": len(due),
             "external_pages_published": 0,
             "external_pages_failed": 0,
+            "external_pages_framing_due": len(framing),
+            "external_pages_framing_checked": 0,
+            "external_pages_frameable": 0,
         }
-        if not self.should_execute or not self.settings.firecrawl_api_key:
+        if not self.should_execute:
             return counts
+        if self.settings.firecrawl_api_key:
+            counts.update(self._scrape_external_pages(pages, selected))
+        counts.update(
+            self._check_external_page_framing(
+                pages, framing[:EXTERNAL_PAGE_FRAME_CHECK_LIMIT]
+            )
+        )
+        return counts
 
+    def _scrape_external_pages(
+        self, pages: dict[str, tuple[str, str]], selected: list[str]
+    ) -> dict[str, int]:
         def prepare(paper_id: str) -> bool:
             title, url = pages[paper_id]
             try:
@@ -441,9 +481,38 @@ class PaperMarkdownBackfillJob(CronJobBase):
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             outcomes = list(executor.map(prepare, selected))
-        counts["external_pages_published"] = sum(outcomes)
-        counts["external_pages_failed"] = len(outcomes) - sum(outcomes)
-        return counts
+        return {
+            "external_pages_published": sum(outcomes),
+            "external_pages_failed": len(outcomes) - sum(outcomes),
+        }
+
+    def _check_external_page_framing(
+        self, pages: dict[str, tuple[str, str]], selected: list[str]
+    ) -> dict[str, int]:
+        def check(paper_id: str) -> bool | None:
+            try:
+                return record_page_framing(
+                    paper_id,
+                    pages[paper_id][1],
+                    bucket_id=self.settings.paper_markdown_hf_bucket_id,
+                    token=self.settings.hf_token or None,
+                )
+            except (HfHubHTTPError, OSError, ValueError) as error:
+                self.logger.info(
+                    "external page framing check failed for %s: %s", paper_id, error
+                )
+                return None
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            outcomes = [
+                outcome
+                for outcome in executor.map(check, selected)
+                if outcome is not None
+            ]
+        return {
+            "external_pages_framing_checked": len(outcomes),
+            "external_pages_frameable": sum(outcomes),
+        }
 
     def _semantic_records(
         self,
@@ -1235,6 +1304,7 @@ class PaperMarkdownBackfillJob(CronJobBase):
                         "error": str(error)[:1000],
                         "requested_version": entry["version"],
                         "version_fallback_attempted": False,
+                        "lfs_pdf_url_attempted": True,
                     },
                     prior=self._bucket_json(status_key),
                     error=error,

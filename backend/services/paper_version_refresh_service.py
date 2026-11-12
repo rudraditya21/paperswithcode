@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
+import httpx
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from backend.models.papers import Paper
+from backend.services.evaluation_service import EvaluationService
+from backend.services.author_hf_profile_sync_service import (
+    HF_PAPERS_URL,
+    AuthorHfProfileSyncService,
+)
 from backend.services.author_service import (
     get_or_create_author_by_name,
     normalize_arxiv_author_name,
 )
 from backend.models.database import (
     Author as DBAuthor,
-    Evaluation as DBEvaluation,
     Paper as DBPaper,
     PaperAuthor,
     PaperConference as DBPaperConference,
@@ -28,6 +34,8 @@ from backend.models.database import (
     PaperTask,
 )
 from backend.utils.exceptions import DatabaseError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -77,6 +85,15 @@ class PaperVersionRefreshService:
             .first()
         )
         created = target is None
+        claim_sources = {
+            paper.id for paper in (previous_latest, target) if paper is not None
+        }
+        hf_paper = None
+        if self._claimed_authors(claim_sources).keys() - _name_keys(metadata.authors):
+            # A claimed author is no longer on the byline under their row's
+            # name, usually because the row took a new name from Hugging Face.
+            # Re-apply the claim from HF's verified claims instead.
+            hf_paper = await _fetch_hf_paper(metadata.arxiv_id)
 
         try:
             if target is None:
@@ -132,6 +149,9 @@ class PaperVersionRefreshService:
                     hf_trending_component=previous_latest.hf_trending_component
                     if previous_latest
                     else None,
+                    x_trending_component=previous_latest.x_trending_component
+                    if previous_latest
+                    else None,
                     hf_artifacts_scanned_at=previous_latest.hf_artifacts_scanned_at
                     if previous_latest
                     else None,
@@ -163,6 +183,10 @@ class PaperVersionRefreshService:
             )
             target.is_latest_version = True
             self.db.add(target)
+            if hf_paper is not None:
+                # The sync queries the new links and latest version.
+                self.db.flush()
+                AuthorHfProfileSyncService(self.db).sync_paper(hf_paper)
             self.db.commit()
             self.db.refresh(target)
         except Exception as exc:
@@ -274,46 +298,11 @@ class PaperVersionRefreshService:
                 dataset_id=link.dataset_id,
             )
 
-        for evaluation in (
-            self.db.query(DBEvaluation)
-            .filter(DBEvaluation.paper_id == source_paper_id)
-            .all()
-        ):
-            exists = (
-                self.db.query(DBEvaluation.id)
-                .filter(
-                    DBEvaluation.paper_id == target_paper_id,
-                    DBEvaluation.task_id == evaluation.task_id,
-                    DBEvaluation.dataset_id == evaluation.dataset_id,
-                    DBEvaluation.model_name == evaluation.model_name,
-                    DBEvaluation.harness == evaluation.harness,
-                    DBEvaluation.best_metric == evaluation.best_metric,
-                )
-                .first()
-            )
-            if exists:
-                continue
-            self.db.add(
-                DBEvaluation(
-                    paper_id=target_paper_id,
-                    task_id=evaluation.task_id,
-                    dataset_id=evaluation.dataset_id,
-                    model_name=evaluation.model_name,
-                    harness=evaluation.harness,
-                    methodology=evaluation.methodology,
-                    metrics=evaluation.metrics,
-                    uses_additional_data=evaluation.uses_additional_data,
-                    is_open=evaluation.is_open,
-                    best_rank=evaluation.best_rank,
-                    best_metric=evaluation.best_metric,
-                    evaluated_on=evaluation.evaluated_on,
-                    external_source_url=evaluation.external_source_url,
-                    source_url=evaluation.source_url,
-                    external=evaluation.external,
-                    num_parameters=evaluation.num_parameters,
-                    hf_model_url=evaluation.hf_model_url,
-                )
-            )
+        # Leaderboards list every version's rows, so results move to the new
+        # version rather than being copied; the old version keeps none.
+        EvaluationService(self.db).move_paper_evaluations(
+            source_paper_id, target_paper_id
+        )
 
     def _add_if_missing(
         self, model: Any, defaults: Optional[Dict[str, Any]] = None, **keys: Any
@@ -325,6 +314,16 @@ class PaperVersionRefreshService:
         values.update(defaults or {})
         self.db.add(model(**values))
 
+    def _claimed_authors(self, paper_ids: set[int]) -> Dict[str, DBAuthor]:
+        return {
+            normalize_arxiv_author_name(author.name).casefold(): author
+            for author in (
+                self.db.query(DBAuthor)
+                .join(PaperAuthor, PaperAuthor.author_id == DBAuthor.id)
+                .filter(PaperAuthor.paper_id.in_(paper_ids), PaperAuthor.claimed)
+            )
+        }
+
     def _replace_paper_authors(
         self, paper_id: int, author_names: List[str], claims_from: Optional[int]
     ) -> None:
@@ -332,19 +331,9 @@ class PaperVersionRefreshService:
         # attached to the claiming author instead of re-matching it by name. A
         # claim follows its author's exact name (any case); if arXiv now spells
         # the name differently, guessing could hand it to a namesake, so the
-        # claim is dropped and sync_hf_author_profiles re-applies it from HF.
+        # claim is dropped here and refresh_arxiv_paper re-applies it from HF.
         names = [normalize_arxiv_author_name(full_name) for full_name in author_names]
-        claimed_authors = {
-            normalize_arxiv_author_name(author.name).casefold(): author
-            for author in (
-                self.db.query(DBAuthor)
-                .join(PaperAuthor, PaperAuthor.author_id == DBAuthor.id)
-                .filter(
-                    PaperAuthor.paper_id.in_({paper_id, claims_from or paper_id}),
-                    PaperAuthor.claimed,
-                )
-            )
-        }
+        claimed_authors = self._claimed_authors({paper_id, claims_from or paper_id})
         self.db.query(PaperAuthor).filter(PaperAuthor.paper_id == paper_id).delete()
 
         linked_ids: set[int] = set()
@@ -364,3 +353,20 @@ class PaperVersionRefreshService:
                     claimed=claimed,
                 )
             )
+
+
+def _name_keys(author_names: List[str]) -> set[str]:
+    return {normalize_arxiv_author_name(name).casefold() for name in author_names}
+
+
+async def _fetch_hf_paper(arxiv_id: str) -> Optional[Dict[str, Any]]:
+    """Return the HF paper with its authorship claims, or None if unavailable."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5)) as client:
+            response = await client.get(f"{HF_PAPERS_URL}/{arxiv_id}")
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        # The claim stays dropped until sync_hf_author_profiles sees the paper.
+        logger.warning("hf_paper_claims_unavailable %s: %s", arxiv_id, exc)
+        return None
+    return response.json()

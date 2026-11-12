@@ -25,8 +25,17 @@ function looksLikePdfUrl(value: unknown): boolean {
   return marker.includes(".pdf") || parsed.pathname.toLowerCase().includes("/pdf");
 }
 
+/**
+ * The original PDF an external paper is archived from. Mirrors
+ * external_pdf_url in .github/workflows/scripts/hourly/backfill_paper_markdown.py.
+ */
+export function externalPaperPdf(paper: Paper): string | null {
+  if (looksLikePdfUrl(paper.source_url)) return safeExternalHref(paper.source_url);
+  return safeExternalHref(paper.conference_url_pdf);
+}
+
 function hasExternalPdf(paper: Paper): boolean {
-  return looksLikePdfUrl(paper.source_url) || Boolean(safeExternalHref(paper.conference_url_pdf));
+  return Boolean(externalPaperPdf(paper));
 }
 
 /** The web page an HTML-only external paper is read from, as Markdown. */
@@ -40,6 +49,26 @@ export function externalPaperWebPage(paper: Paper): string | null {
   return href;
 }
 
+/**
+ * Whether a web paper's original page is known to allow framing without
+ * asking the server. GitHub Pages cannot send X-Frame-Options or CSP headers;
+ * other pages are framed only once the hourly header check allowed them,
+ * because a blocked frame renders blank.
+ */
+export function framesOriginalPage(href: string): boolean {
+  const parsed = new URL(href);
+  return parsed.protocol === "https:" && parsed.hostname.toLowerCase().endsWith(".github.io");
+}
+
+/** Whether two links open the same page, ignoring scheme, `www.`, and a trailing slash. */
+export function sameWebPage(left: string, right: string): boolean {
+  const key = (href: string) => {
+    const parsed = new URL(href);
+    return `${parsed.hostname.replace(/^www\./, "")}${parsed.pathname.replace(/\/+$/, "")}${parsed.search}`;
+  };
+  return key(left) === key(right);
+}
+
 export function paperReaderRoute(paper: Paper, fallbackRoute: string): string | null {
   if (paper.source === "external") {
     const readable = hasExternalPdf(paper) || Boolean(externalPaperWebPage(paper));
@@ -49,12 +78,17 @@ export function paperReaderRoute(paper: Paper, fallbackRoute: string): string | 
   return safeExternalHref(paper.url_pdf) && route ? `/pdf/${route}` : null;
 }
 
+// Per-paper reader state in sessionStorage, keyed by the reader route ID.
+export const readerSessionKey = (readerId: string) => `pwc:reader:session:${readerId}`;
+export const readerCollapsedKey = (readerId: string) => `pwc:reader:assistant-collapsed:${readerId}`;
+export const readerPageKey = (readerId: string) => `pwc:reader:page:${readerId}`;
+
 /** Opens the reader on page 1 with a fresh, expanded assistant. */
 export function resetReaderSession(readerRoute: string): void {
   const readerId = readerRoute.slice("/pdf/".length);
-  sessionStorage.removeItem(`pwc:reader:session:${readerId}`);
-  sessionStorage.removeItem(`pwc:reader:assistant-collapsed:${readerId}`);
-  sessionStorage.removeItem(`pwc:reader:page:${readerId}`);
+  sessionStorage.removeItem(readerSessionKey(readerId));
+  sessionStorage.removeItem(readerCollapsedKey(readerId));
+  sessionStorage.removeItem(readerPageKey(readerId));
 }
 
 const CANONICAL_HEADER = /^Title: [^\n]*\n\nURL Source: [^\n]*\n\nMarkdown Content:\n/;

@@ -16,15 +16,22 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from huggingface_hub import HfFileSystem, batch_bucket_files, download_bucket_files
+from huggingface_hub import batch_bucket_files, download_bucket_files
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageDraw, ImageFont
 
 from backend.config import get_settings
 from backend.services.arxiv_service import ArxivPdfUnavailableError, ArxivService
+from backend.services.hf_bucket_filesystem import BucketFileSystem
+from backend.services.paper_markdown_service import stream_external_paper_pdf
 from backend.services.safe_outbound_http_service import (
     SafeOutboundHttpError,
     fetch_public_resource,
+)
+from backend.services.thumbnail_artwork import (
+    compose_artwork_thumbnail,
+    find_page_artwork_urls,
+    load_artwork_image,
 )
 from backend.utils.biorxiv import (
     BioRxivMetadata,
@@ -52,9 +59,17 @@ EXTERNAL_THUMBNAIL_DIRECT_HOSTS = frozenset(
         "ecmlpkdd-storage.s3.eu-central-1.amazonaws.com",
         "github.com",
         "huggingface.co",
+        # huggingface.co/.../resolve/... redirects LFS and Xet files to these CDNs.
+        "cas-bridge.xethub.hf.co",
+        "cdn-lfs.hf.co",
+        "cdn-lfs-eu-1.hf.co",
+        "cdn-lfs-us-1.hf.co",
+        "us.aws.cdn.hf.co",
         "ieeexplore.ieee.org",
         # github.com/<owner>/<repo>/raw/... redirects Git LFS files here.
         "media.githubusercontent.com",
+        # ECCV conference PDFs (papers.conference_url_pdf).
+        "media.eventhosts.cc",
         "medrxiv.org",
         "microsoft.ai",
         "nature.com",
@@ -79,8 +94,30 @@ EXTERNAL_THUMBNAIL_DIRECT_HOSTS = frozenset(
         "zenodo.org",
     }
 )
+# raw.githubusercontent.com and many object stores label PDFs as generic binary;
+# the `%PDF` magic-byte check below still rejects anything that is not a PDF.
+EXTERNAL_PDF_CONTENT_TYPES = frozenset(
+    {"application/pdf", "application/octet-stream", "binary/octet-stream"}
+)
 PERMANENT_EXTERNAL_PDF_SAFE_STATUSES = frozenset({403, 409, 413, 415, 422})
 PERMANENT_EXTERNAL_PDF_ORIGIN_STATUSES = frozenset({403, 404, 410})
+EXTERNAL_PAGE_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+# Some object stores label images as generic binary; Pillow decides.
+EXTERNAL_ARTWORK_CONTENT_TYPES = frozenset(
+    {
+        "image/gif",
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp",
+        "application/octet-stream",
+        "binary/octet-stream",
+    }
+)
+EXTERNAL_PAGE_MAX_BYTES = 5 * 1024 * 1024
+EXTERNAL_ARTWORK_MAX_BYTES = 15 * 1024 * 1024
+EXTERNAL_ARTWORK_TIMEOUT_SECONDS = 20.0
+MAX_EXTERNAL_ARTWORK_CANDIDATES = 3
 # Paper cards render thumbnails in a 160×220 box, but PDF pages have their own
 # MediaBox/CropBox aspect ratio. Keep the page ratio in the JPEG and let the
 # frontend containment frame handle the small per-page difference.
@@ -340,7 +377,7 @@ class ThumbnailService:
         self.bucket_prefix = self.settings.thumbnail_hf_bucket_prefix.strip("/")
         self.hf_token = self.settings.hf_token or None
         self.hf_fs = (
-            HfFileSystem(token=self.hf_token)
+            BucketFileSystem(token=self.hf_token)
             if self.storage_backend == "hf_bucket"
             else None
         )
@@ -649,7 +686,7 @@ class ThumbnailService:
         try:
             result = await fetch_public_resource(
                 pdf_url,
-                allowed_content_types=frozenset({"application/pdf"}),
+                allowed_content_types=EXTERNAL_PDF_CONTENT_TYPES,
                 max_bytes=self.max_pdf_size,
                 timeout_seconds=self.pdf_timeout,
                 allowed_hosts=EXTERNAL_THUMBNAIL_DIRECT_HOSTS,
@@ -673,6 +710,74 @@ class ThumbnailService:
         if not result.body.startswith(b"%PDF"):
             return None
         return result.body
+
+    def _is_transient_fetch_error(self, exc: SafeOutboundHttpError) -> bool:
+        """Origin 5xx/429, timeouts, and connection failures may succeed later."""
+        if exc.status_code != 502:
+            return False
+        origin = exc.origin_status_code
+        return origin is None or origin == 429 or origin >= 500
+
+    async def _fetch_external_artwork(self, source_url: str) -> Image.Image | None:
+        """
+        Return the source page's social preview image, if it has a usable one.
+
+        Permanent failures (bot walls, 404s, non-HTML sources, unusable
+        images) return None so the caller can draw a title card; transient
+        ones raise so the paper is retried instead of caching a title card.
+        """
+        try:
+            page = await fetch_public_resource(
+                source_url,
+                allowed_content_types=EXTERNAL_PAGE_CONTENT_TYPES,
+                max_bytes=EXTERNAL_PAGE_MAX_BYTES,
+                timeout_seconds=EXTERNAL_ARTWORK_TIMEOUT_SECONDS,
+            )
+        except SafeOutboundHttpError as exc:
+            if self._is_transient_fetch_error(exc):
+                raise ThumbnailGenerationError(
+                    "External source page is temporarily unavailable"
+                ) from exc
+            return None
+
+        html = page.body.decode("utf-8", errors="replace")
+        candidates = find_page_artwork_urls(html, page.url)
+        for artwork_url in candidates[:MAX_EXTERNAL_ARTWORK_CANDIDATES]:
+            try:
+                artwork = await fetch_public_resource(
+                    artwork_url,
+                    allowed_content_types=EXTERNAL_ARTWORK_CONTENT_TYPES,
+                    max_bytes=EXTERNAL_ARTWORK_MAX_BYTES,
+                    timeout_seconds=EXTERNAL_ARTWORK_TIMEOUT_SECONDS,
+                )
+            except SafeOutboundHttpError as exc:
+                if self._is_transient_fetch_error(exc):
+                    raise ThumbnailGenerationError(
+                        "External source artwork is temporarily unavailable"
+                    ) from exc
+                continue
+            image = load_artwork_image(artwork.body)
+            if image is not None:
+                return image
+        return None
+
+    def _read_archived_external_pdf(self, paper_id: int | str) -> Optional[bytes]:
+        """
+        Read the PDF archived at ingestion or by the OCR worker, if any.
+
+        Covers sources that moved or vanished upstream after indexing.
+        """
+        try:
+            chunks, size = stream_external_paper_pdf(
+                str(paper_id),
+                bucket_id=self.settings.paper_markdown_hf_bucket_id,
+                token=self.settings.hf_token,
+            )
+        except ValueError:
+            return None
+        if size > self.max_pdf_size:
+            return None
+        return b"".join(chunks)
 
     def _save_thumbnail(self, image: Image.Image, cache_path: Path) -> None:
         """
@@ -858,8 +963,10 @@ class ThumbnailService:
 
         Direct PDFs are rendered from their first page; `pdf_url` (e.g. the
         paper's conference PDF) is tried before `source_url`, which is often
-        an HTML landing page. bioRxiv and medRxiv records can fall back to a
-        metadata card when their PDF is unavailable.
+        an HTML landing page, and the archived copy is used when neither
+        serves a PDF. bioRxiv and medRxiv records can fall back to a
+        metadata card when their PDF is unavailable. Other pages use their
+        social preview artwork, and a title card only when they have none.
         """
         filename = self.get_external_filename(paper_id)
         if not force:
@@ -888,6 +995,8 @@ class ThumbnailService:
                 pdf_url_error = exc
         if pdf_content is None:
             pdf_content = await self._download_external_pdf(source_url)
+        if pdf_content is None:
+            pdf_content = self._read_archived_external_pdf(paper_id)
         if pdf_content is None and pdf_url_error is not None:
             # Retry later instead of caching a metadata card in place of
             # a PDF that is only temporarily unavailable.
@@ -903,7 +1012,11 @@ class ThumbnailService:
                 )
             thumbnail = self._render_biorxiv_metadata_thumbnail(metadata, server)
         else:
-            thumbnail = self._render_external_metadata_thumbnail(title, source_url)
+            artwork = await self._fetch_external_artwork(source_url)
+            if artwork is not None:
+                thumbnail = compose_artwork_thumbnail(artwork)
+            else:
+                thumbnail = self._render_external_metadata_thumbnail(title, source_url)
 
         self._save_thumbnail(thumbnail, cache_path)
         self._upload_to_bucket(cache_path, filename)

@@ -10,7 +10,10 @@ from sqlalchemy.orm import Session
 
 from backend.config import get_settings
 from backend.database.connection import get_database_session
-from backend.services.author_service import organization_slug_for_author
+from backend.services.author_service import (
+    merged_author_id,
+    organization_slug_for_author,
+)
 from backend.services.content_negotiation_service import (
     prefers_markdown,
     public_page_headers,
@@ -21,6 +24,7 @@ from backend.services.discovery_page_service import (
     DiscoveryPage,
     DiscoveryPageService,
 )
+from backend.services.legacy_url_service import LegacyUrlService
 from backend.services.public_page_markdown_service import render_discovery_markdown
 from backend.services.spa_shell_service import load_index_html
 
@@ -38,6 +42,9 @@ RESERVED_TOP_LEVEL_PREFIXES = frozenset(
         "tasks",
         "task",
         "methods",
+        "method",
+        "sota",
+        "dataset",
         "benchmark",
         "conferences",
         "organizations",
@@ -49,6 +56,8 @@ RESERVED_TOP_LEVEL_PREFIXES = frozenset(
         "submit",
         "saved",
         "following",
+        "topics",
+        "x-trending",
         "settings",
         "authorize-paper-edit",
         "privacy",
@@ -81,6 +90,8 @@ KNOWN_CLIENT_TOP_LEVEL_PREFIXES = frozenset(
         "submit",
         "saved",
         "following",
+        "topics",
+        "x-trending",
         "settings",
         "authorize-paper-edit",
         "privacy",
@@ -93,7 +104,10 @@ KNOWN_CLIENT_TOP_LEVEL_PREFIXES = frozenset(
         "astra-for-robotics",
     }
 )
-ORGANIZATION_SLUG_ALIASES = {"googledeepmind": "google"}
+ORGANIZATION_SLUG_ALIASES = {
+    "googledeepmind": "google",
+    "microsoftresearch": "microsoft",
+}
 # Methods that were removed in favour of a task of the same topic.
 METHOD_SLUGS_MOVED_TO_TASKS = {"continual-learning": "continual-learning"}
 
@@ -173,6 +187,38 @@ def legacy_task_page(slug: str) -> RedirectResponse:
     return RedirectResponse(f"/tasks/{slug}", status_code=301)
 
 
+def _legacy_redirect(path: str | None) -> Response:
+    if path is None:
+        return _not_found()
+    return RedirectResponse(
+        path, status_code=301, headers={"Cache-Control": "public, max-age=3600"}
+    )
+
+
+@router.api_route("/sota/{slug}", methods=["GET", "HEAD"], include_in_schema=False)
+def legacy_sota_page(
+    slug: str, db: Session = Depends(get_database_session)
+) -> Response:
+    return _legacy_redirect(LegacyUrlService(db).sota_path(slug))
+
+
+@router.api_route("/dataset/{slug}", methods=["GET", "HEAD"], include_in_schema=False)
+def legacy_dataset_page(
+    slug: str, db: Session = Depends(get_database_session)
+) -> Response:
+    return _legacy_redirect(LegacyUrlService(db).dataset_path(slug))
+
+
+@router.api_route("/method/{slug}", methods=["GET", "HEAD"], include_in_schema=False)
+def legacy_method_page(
+    slug: str, db: Session = Depends(get_database_session)
+) -> Response:
+    task_slug = METHOD_SLUGS_MOVED_TO_TASKS.get(slug)
+    if task_slug is not None:
+        return _legacy_redirect(f"/tasks/{task_slug}")
+    return _legacy_redirect(LegacyUrlService(db).method_path(slug))
+
+
 @router.api_route("/methods/{slug}", methods=["GET", "HEAD"], include_in_schema=False)
 def method_page(
     slug: str, request: Request, db: Session = Depends(get_database_session)
@@ -220,9 +266,10 @@ def conference_task_page(
 def author_page(
     author_id: int, request: Request, db: Session = Depends(get_database_session)
 ) -> Response:
-    org_slug = organization_slug_for_author(db, author_id)
-    if org_slug:
-        target = f"/orgs/{org_slug}"
+    merged_into = merged_author_id(db, author_id)
+    org_slug = None if merged_into else organization_slug_for_author(db, author_id)
+    if merged_into or org_slug:
+        target = f"/authors/{merged_into}" if merged_into else f"/orgs/{org_slug}"
         if request.url.query:
             target = f"{target}?{request.url.query}"
         return RedirectResponse(target, status_code=301)

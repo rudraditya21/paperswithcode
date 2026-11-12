@@ -1,17 +1,16 @@
-import { paperQueryKeys } from "@/lib/paperQueryKeys";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
 import { useToast } from "@/hooks/use-toast";
-import { useEvaluationsByPaper } from "@/hooks/useEvaluations";
 import { useHuggingFaceRepos } from "@/hooks/useHuggingFaceRepos";
-import { usePaper } from "@/hooks/usePapers";
 import { evaluationsApi } from "@/lib/api/evaluations";
 import { papersApi } from "@/lib/api/papers";
-import { DEFAULT_SITE_SUFFIX, formatPageTitle } from "@/lib/latexPlainText";
-import { usePreferences } from "@/lib/preferencesContext";
-import { normalizePaperRouteId } from "@/lib/utils";
+import { evaluationQueries, paperQueries } from "@/lib/api/queries";
+import { formatPageTitle } from "@/lib/latexPlainText";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { usePreferences } from "@/lib/preferences";
+import { normalizePaperRouteId, stripArxivVersion } from "@/lib/utils";
 import { buildPaperDetailPresentation } from "@/lib/paperDetailPresentation";
 
 const PAPER_SECTION_IDS = ["tldr", "abstract", "tasks", "methods", "results"] as const;
@@ -34,10 +33,6 @@ export function parsePaperSectionHash(rawHash: string): {
 export const resultsTaskAnchorId = (taskSlug: string) => `results-task-${taskSlug}`;
 export const resultsTaskHash = (taskSlug: string) =>
   `#results?task=${encodeURIComponent(taskSlug)}`;
-
-export function secondaryQueriesReady(enabled: boolean, paperId?: string): boolean {
-  return enabled && Boolean(paperId);
-}
 
 interface ConflictRefreshOptions {
   direct: boolean;
@@ -67,7 +62,7 @@ export function usePaperDetailPageModel(
   const navigate = useNavigate();
   const { toast } = useToast();
   const { preferences } = usePreferences();
-  const paperQuery = usePaper(arxivId, Boolean(arxivId));
+  const paperQuery = useQuery(paperQueries.detail(arxivId));
   const paper = paperQuery.data;
   const [secondaryQueriesEnabled, setSecondaryQueriesEnabled] = useState(false);
 
@@ -78,13 +73,7 @@ export function usePaperDetailPageModel(
     });
   }, [arxivId, navigate, rawArxivId]);
 
-  useEffect(() => {
-    if (!paper?.title) return;
-    document.title = paper.page_title || formatPageTitle(paper.title);
-    return () => {
-      document.title = DEFAULT_SITE_SUFFIX;
-    };
-  }, [paper?.page_title, paper?.title]);
+  useDocumentTitle(paper?.title && (paper.page_title || formatPageTitle(paper.title)));
 
   useEffect(() => {
     setSecondaryQueriesEnabled(false);
@@ -93,22 +82,22 @@ export function usePaperDetailPageModel(
     return () => window.clearTimeout(timeoutId);
   }, [paper?.id]);
 
-  const secondaryReady = secondaryQueriesReady(secondaryQueriesEnabled, paper?.id);
+  const secondaryReady = secondaryQueriesEnabled && Boolean(paper?.id);
   const hfQuery = useHuggingFaceRepos(
     secondaryQueriesEnabled ? paper?.arxiv_id : undefined,
   );
-  const evaluationsQuery = useEvaluationsByPaper(paper?.id, secondaryReady);
+  const evaluationsQuery = useQuery({
+    ...evaluationQueries.byPaper(paper?.id),
+    enabled: secondaryReady,
+    refetchOnMount: "always",
+  });
   const versionsQuery = useQuery({
-    queryKey: [...paperQueryKeys.feeds.versions, paper?.arxiv_id],
-    queryFn: () => papersApi.versions(paper!.arxiv_id!.replace(/v\d+$/, "")),
-    enabled: secondaryReady && Boolean(paper?.arxiv_id),
-    staleTime: 10 * 60 * 1000,
+    ...paperQueries.versions(paper?.arxiv_id ? stripArxivVersion(paper.arxiv_id) : undefined),
+    enabled: secondaryReady,
   });
   const relatedQuery = useQuery({
-    queryKey: [...paperQueryKeys.feeds.related, paper?.id],
-    queryFn: () => papersApi.related(paper!.arxiv_id || paper!.id, 4),
+    ...paperQueries.related(paper?.arxiv_id || paper?.id),
     enabled: secondaryReady,
-    staleTime: 10 * 60 * 1000,
   });
 
   useEffect(() => {
@@ -164,10 +153,6 @@ export function usePaperDetailPageModel(
     return [...groups.values()];
   }, [visibleEvaluations]);
 
-  const resultsTaskSlugsKey = useMemo(
-    () => evaluationsByTask.map(({ taskSlug }) => taskSlug ?? "").join("|"),
-    [evaluationsByTask],
-  );
   const presentation = useMemo(
     () => paper ? buildPaperDetailPresentation(paper, hfQuery.data, hfQuery.isLoading) : null,
     [hfQuery.data, hfQuery.isLoading, paper],
@@ -216,7 +201,6 @@ export function usePaperDetailPageModel(
     evaluationsByTask,
     evaluationsQuery.isLoading,
     paper,
-    resultsTaskSlugsKey,
     secondaryReady,
   ]);
 
@@ -225,8 +209,6 @@ export function usePaperDetailPageModel(
     evaluations: evaluationsQuery.data,
     evaluationsByTask,
     evaluationsLoading: evaluationsQuery.isLoading,
-    hfLoading: hfQuery.isLoading,
-    hfRepos: hfQuery.data,
     paper,
     paperError: paperQuery.error,
     paperLoading: paperQuery.isLoading,

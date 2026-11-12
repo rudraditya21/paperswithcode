@@ -1,28 +1,38 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useMutation } from "@tanstack/react-query";
 import "./PaperDetailView.css";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
-import { Icon, PaperPreview, SotaBadges } from "@/components";
+import { Icon } from "@/components/Icon";
+import { PaperPreview } from "@/components/PaperPreview";
+import { SotaBadges } from "@/components/SotaBadges";
 import LatexTitle from "@/components/LatexTitle";
 import { evaluationsApi } from "@/lib/api/evaluations";
 import { papersApi } from "@/lib/api/papers";
 import {
   assetUrl,
+  isCodexEnrichPaperEnabled,
   isNativePdfReaderEnabled,
   isPaperReaderChatEnabled,
   isStagingEnvironment,
 } from "@/lib/apiUrl";
 import { useAuth } from "@/lib/authContext";
+import { usePreferences } from "@/lib/preferences";
 import { paperEditSubmitMode } from "@/lib/contributorCapabilities";
 import { toSotaRanks } from "@/lib/transform";
 import { leaderboardBadgeMarkdown } from "@/lib/leaderboardBadges";
 import { paperReaderRoute, resetReaderSession } from "@/lib/paperReader";
 import { usePaperDetailPageModel } from "@/hooks/usePaperDetailPageModel";
+import { usePaperEditState } from "@/hooks/usePaperEditState";
+import { ApiError, getApiErrorMessage } from "@/lib/apiTransport";
 import {
-  parseFreshAuthEditSection,
-  usePaperEditState,
-} from "@/hooks/usePaperEditState";
-import type { PaperEditSection } from "@/hooks/usePaperEditState";
+  FRESH_AUTH_EDIT_KEY,
+  PAPER_EDIT_SECTION_LABELS,
+  isPaperEditSection,
+  type PaperEditSection,
+} from "@/lib/paperCuration";
+import { stripArxivVersion } from "@/lib/utils";
+import { mlInternReproduceUrl } from "@/lib/mlIntern";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -42,22 +52,9 @@ import { PaperMetadataSections } from "@/components/paper-detail/PaperMetadataSe
 import { SignInToEditDialog } from "@/components/paper-detail/SignInToEditDialog";
 import { SavePaperButton } from "@/components/paper-detail/SavePaperButton";
 import { EditableActionButton } from "@/components/paper-detail/EditableActionButton";
-import { CodexEnrichPaperDialog } from "@/components/paper-detail/CodexEnrichPaperDialog";
-import { isCodexEnrichPaperEnabled } from "@/lib/codexAddEvals";
+import { CodexPaperJobDialog } from "@/components/paper-detail/CodexPaperJobDialog";
 import { organizationShortName } from "@/lib/organizationNames";
 import { AuthorAvatar } from "@/components/AuthorAvatar";
-
-const EDIT_SECTION_LABEL: Record<PaperEditSection, string> = {
-  tasks: "tasks",
-  methods: "methods",
-  results: "evaluation results",
-  repositories: "GitHub repositories",
-  "project-pages": "project pages",
-  "hf-artifacts": "Hugging Face artifacts",
-  organizations: "organizations",
-  "source-url": "source URL",
-  "x-threads": "X threads",
-};
 
 function formatLongDate(iso: string | null | undefined): string {
   if (!iso) return "—";
@@ -88,6 +85,7 @@ const PaperDetailView: React.FC = () => {
   // Admins can save edits directly. Linked authors and everyone else go
   // through the pending-edit queue for admin review.
   const isAdmin = user?.is_admin ?? false;
+  const { setHideClosedSourceEvals } = usePreferences();
   const isSignedIn = !!user;
   const editSubmitMode = paperEditSubmitMode(user);
 
@@ -113,12 +111,12 @@ const PaperDetailView: React.FC = () => {
 
   useEffect(() => {
     if (editSubmitMode !== "direct" || !paper?.id) return;
-    if (activeEditor && activeEditor !== "results") {
+    if (activeEditor && activeEditor !== "evaluations") {
       void papersApi
         .primeCurationState(paper.id)
         .catch(() => undefined);
     }
-    if (activeEditor === "results") {
+    if (activeEditor === "evaluations") {
       void evaluationsApi
         .primeCurationState(paper.id)
         .catch(() => undefined);
@@ -130,14 +128,13 @@ const PaperDetailView: React.FC = () => {
 
   useEffect(() => {
     if (!user || !paper || freshAuthRecoveryHandled.current) return;
-    const section = sessionStorage.getItem("pwc:fresh-auth-edit");
+    const section = sessionStorage.getItem(FRESH_AUTH_EDIT_KEY);
     if (!section) return;
     freshAuthRecoveryHandled.current = true;
-    const editor = parseFreshAuthEditSection(section);
     const draft = papersApi.freshAuthMutationDraft();
     if (!draft) {
-      sessionStorage.removeItem("pwc:fresh-auth-edit");
-      if (editor) openEditor(editor);
+      sessionStorage.removeItem(FRESH_AUTH_EDIT_KEY);
+      if (isPaperEditSection(section)) openEditor(section);
       return;
     }
     if (
@@ -189,37 +186,20 @@ const PaperDetailView: React.FC = () => {
   };
 
   // Auto-index if missing.
-  const [indexState, setIndexState] = useState<"idle" | "indexing">("idle");
-  const [indexError, setIndexError] = useState<string | null>(null);
-  const [indexErrorHint, setIndexErrorHint] = useState<string | null>(null);
-
-  const handleIndex = async () => {
-    if (!arxivId) return;
-    setIndexState("indexing");
-    setIndexError(null);
-    setIndexErrorHint(null);
-    try {
-      await papersApi.indexFromArxiv(arxivId);
+  const indexPaper = useMutation({
+    mutationFn: () => papersApi.indexFromArxiv(arxivId),
+    onSuccess: () => {
       toast({ title: "Indexed", description: "Paper added to database." });
       setTimeout(() => refetch(), 1200);
-      setIndexState("idle");
-    } catch (e) {
-      const err = e as { response?: string; message?: string; status?: number };
-      let msg = err.message || "Failed to index paper";
-      if (err.response) {
-        try {
-          msg = JSON.parse(err.response).detail || msg;
-        } catch {
-          msg = err.response;
-        }
-      }
-      setIndexError(msg);
-      if (err.status === 429 || err.status === 503) {
-        setIndexErrorHint("Try again later after arXiv has lifted the temporary limit.");
-      }
-      setIndexState("idle");
-    }
-  };
+    },
+  });
+  const indexError = indexPaper.error
+    ? getApiErrorMessage(indexPaper.error, "Failed to index paper")
+    : null;
+  const indexErrorHint =
+    indexPaper.error instanceof ApiError && [429, 503].includes(indexPaper.error.status)
+      ? "Try again later after arXiv has lifted the temporary limit."
+      : null;
 
   const citationCopy = presentation?.citationCopy ?? "";
   const copyableRanks = presentation?.copyableRanks ?? [];
@@ -296,9 +276,9 @@ const PaperDetailView: React.FC = () => {
         )}
         <div className="action-row">
           {isAdmin && (
-            <button className="action-btn" onClick={handleIndex} disabled={indexState === "indexing"}>
+            <button className="action-btn" onClick={() => arxivId && indexPaper.mutate()} disabled={indexPaper.isPending}>
               <Icon name="sparkle" size={12} />
-              {indexState === "indexing" ? "Indexing…" : "Index from arXiv"}
+              {indexPaper.isPending ? "Indexing…" : "Index from arXiv"}
             </button>
           )}
           <Button variant="outline" onClick={() => navigate("/papers")}>
@@ -447,7 +427,7 @@ const PaperDetailView: React.FC = () => {
                   onChange={(e) => {
                     const v = e.target.value;
                     if (!paper.arxiv_id) return;
-                    navigate(`/paper/${paper.arxiv_id.replace(/v\d+$/, "")}${v ? `?version=${v}` : ""}`);
+                    navigate(`/paper/${stripArxivVersion(paper.arxiv_id)}${v ? `?version=${v}` : ""}`);
                   }}
                 >
                   {versions.map((v) => (
@@ -520,7 +500,7 @@ const PaperDetailView: React.FC = () => {
             {safeAbstractUrl && paper.source === "external" && (
               <EditableActionButton
                 showEdit
-                onEdit={() => openEdit("source-url")}
+                onEdit={() => openEdit("source_url")}
                 editAriaLabel="Edit source URL"
               >
                 <a
@@ -536,7 +516,7 @@ const PaperDetailView: React.FC = () => {
             {projectPages.length === 1 ? (
               <EditableActionButton
                 showEdit
-                onEdit={() => openEdit("project-pages")}
+                onEdit={() => openEdit("project_pages")}
                 editAriaLabel="Edit project pages"
               >
                 <a
@@ -552,7 +532,7 @@ const PaperDetailView: React.FC = () => {
             {projectPages.length > 1 ? (
               <EditableActionButton
                 showEdit
-                onEdit={() => openEdit("project-pages")}
+                onEdit={() => openEdit("project_pages")}
                 editAriaLabel="Edit project pages"
               >
                 <DropdownMenu>
@@ -584,7 +564,7 @@ const PaperDetailView: React.FC = () => {
               <button
                 type="button"
                 className="action-btn"
-                onClick={() => openEdit("project-pages")}
+                onClick={() => openEdit("project_pages")}
                 title="Add project page"
               >
                 <Icon name="globe" size={12} /> Add project page
@@ -595,9 +575,20 @@ const PaperDetailView: React.FC = () => {
                 <Icon name="external" size={12} /> Conference
               </a>
             )}
+            <a
+              className="action-btn"
+              href={mlInternReproduceUrl(paper.title, paper.arxiv_id)}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Ask Hugging Face ML Intern to reproduce this paper"
+            >
+              <span className="ml-intern-icon"><Icon name="robot" size={12} /></span> Reproduce with ML Intern
+            </a>
             <PaperAgentEdits paperId={Number(paper.id)} />
             {isAdmin && isCodexEnrichPaperEnabled() && (
-              <CodexEnrichPaperDialog
+              <CodexPaperJobDialog
+                kind="enrich-paper"
+                triggerClassName="action-btn"
                 paperId={Number(paper.id)}
                 paperTitle={paper.title}
                 onComplete={() => void refetch()}
@@ -730,10 +721,12 @@ const PaperDetailView: React.FC = () => {
             canEdit
             evaluationsByTask={evaluationsByTask}
             evaluationsLoading={evaluationsLoading}
+            hiddenClosedSourceCount={(evaluations?.length ?? 0) - (visibleEvaluations?.length ?? 0)}
             isAdmin={isAdmin}
             onCopyBadge={handleCopyLeaderboardBadge}
-            onEdit={() => openEdit("results")}
+            onEdit={() => openEdit("evaluations")}
             onRefresh={() => void refetchEvaluations()}
+            onShowClosedSourceEvals={() => setHideClosedSourceEvals(false)}
             paper={paper}
             visibleEvaluationCount={visibleEvaluations?.length ?? 0}
           />
@@ -746,9 +739,9 @@ const PaperDetailView: React.FC = () => {
           citationDisplay={citationDisplay}
           hfArtifactViewer={hfArtifactViewer}
           onCopyCitation={handleCopyCitation}
-          onEditHfArtifacts={() => openEdit("hf-artifacts")}
+          onEditHfArtifacts={() => openEdit("hf_artifacts")}
           onEditRepositories={() => openEdit("repositories")}
-          onEditXThreads={() => openEdit("x-threads")}
+          onEditXThreads={() => openEdit("x_threads")}
           paper={paper}
           relatedIsLoading={relatedQ.isLoading}
           relatedPapers={relatedQ.data}
@@ -772,7 +765,7 @@ const PaperDetailView: React.FC = () => {
           if (!open) setSignInSection(null);
         }}
         sectionLabel={
-          signInSection ? EDIT_SECTION_LABEL[signInSection] : "this paper"
+          signInSection ? PAPER_EDIT_SECTION_LABELS[signInSection] : "this paper"
         }
         returnTo={typeof window !== "undefined" ? window.location.pathname : "/"}
       />

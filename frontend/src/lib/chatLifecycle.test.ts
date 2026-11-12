@@ -22,14 +22,14 @@ describe("chatLifecycleReducer", () => {
       event: { type: "lifecycle", phase: "preparing_workspace" },
     });
     expect(state.messages[0]).toMatchObject({
-      status: "Preparing secure workspace…",
+      progress: "preparing_workspace",
       blocks: [],
     });
     state = chatLifecycleReducer(state, {
       type: "event",
       event: { type: "reasoning_start" },
     });
-    expect(state.messages[0].status).toBeUndefined();
+    expect(state.messages[0].progress).toBeUndefined();
   });
 
   it("projects stream events and terminal completion without mutation", () => {
@@ -57,7 +57,7 @@ describe("chatLifecycleReducer", () => {
     });
 
     expect(started.messages[0].blocks).toEqual([]);
-    expect(completed).toMatchObject({ sessionId: "session-1", phase: "complete" });
+    expect(completed).toMatchObject({ sessionId: "session-1" });
     expect(completed.messages[0]).toMatchObject({
       streaming: false,
       blocks: [{ kind: "answer", text: "Hello", done: true }],
@@ -87,7 +87,6 @@ describe("chatLifecycleReducer", () => {
       },
     });
 
-    expect(completed.phase).toBe("complete");
     expect(completed.messages[0]).toMatchObject({
       streaming: false,
       finishReason: "scope_blocked",
@@ -109,7 +108,6 @@ describe("chatLifecycleReducer", () => {
     const state = actions.reduce(chatLifecycleReducer, initialChatLifecycle());
 
     expect(state.title).toBe(" New title");
-    expect(state.phase).toBe("failed");
     expect(state.messages[0]).toMatchObject({ error: "Failed", errorCode: "provider_error" });
     expect(state.messages[0].blocks).toEqual([
       { kind: "reasoning", text: "Plan", active: false, open: false },
@@ -133,7 +131,6 @@ describe("chatLifecycleReducer", () => {
 
     const stopped = chatLifecycleReducer(started, { type: "stop" });
 
-    expect(stopped.phase).toBe("stopped");
     expect(stopped.messages[0]).toMatchObject({ streaming: false, finishReason: "stopped" });
     expect(stopped.messages[0].blocks).toEqual([
       { kind: "reasoning", text: "Partial", active: false, open: false },

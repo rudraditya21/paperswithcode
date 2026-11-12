@@ -64,6 +64,19 @@ report questionable existing links separately.
 If context includes `retry_feedback`, address its exact rejection before apply.
 Re-read current rows and sources; a prior proposal is not evidence.
 
+When context has `promoted_benchmark`, this add-evals job re-checks the paper
+for that one new benchmark only. Submit evaluations and `evaluation_removals`
+only for `promoted_benchmark.dataset_id`, and report every other benchmark the
+paper mentions as `not_applicable` with detail `outside the promoted benchmark`;
+the server rejects rows on any other dataset.
+
+`context.paper.removed_leaderboards` lists the task/dataset boards where a row
+of this paper was deleted, usually by a curator after author feedback. Never
+propose a new row there or remove the row that survived: the server skips such
+new rows (`evaluations_skipped_removed`) and rejects such removals. Report the benchmark as `not_applicable`
+with detail `removed by a curator`. Updating this paper's existing row there is
+still allowed.
+
 Choose the workflow from the context's job kind. For `enrich-paper`, submit
 only the `enrich` payload; keep `evaluations`, `evaluation_removals`,
 `validation_evidence`, and `benchmark_gaps` as empty arrays. Benchmark discovery
@@ -113,37 +126,54 @@ or a mismatch, including fractions that happen to fit inside 0–100 bounds.
 If metadata conflicts with source or existing leaderboard evidence, skip the
 result and report the conflict instead of choosing a scale arbitrarily.
 
-### Benchmark chart images (add-evals only)
+### Benchmark result images (add-evals only)
 
-Many model cards, READMEs, and release pages publish their scores only as an
-embedded benchmark chart. When a source document has no text table or prose
-score for a benchmark but embeds a results image (`<img>`, Markdown
-`![...](...)`), you may read that image:
+Lab release pages, model cards, and READMEs often publish their whole results
+table or chart only as an image; the page text may mention just a few scores.
+Read result images before you list the paper's benchmarks:
 
-1. Resolve the image URL from the source document (absolute, first-party: the
-   model repo, the release page's own domain, or its GitHub repo). Download it
-   to `/tmp/charts/` with Python (`urllib.request`, browser User-Agent), then
-   open the local file with the `view_image` tool.
-2. Import only values printed on the chart as numbers (a data label on or
-   above the bar, or a value in a chart table). Never estimate a value from bar
-   height, axis gridlines, or pixel position; skip unlabeled bars.
-3. The bar must unambiguously belong to the introduced model: its label or
-   legend entry names the release, and the legend color-to-model mapping is
-   clear. Comparator bars stay excluded, as in text tables.
-4. Apply every text-table rule: exact benchmark version, split, setting
-   (thinking/tools/pass@k), metric definition, and scale. A chart panel title
-   such as `SWE-bench Verified` names the benchmark; a footnote may define the
-   protocol. If the chart omits protocol details that the leaderboard needs,
-   skip and report.
-5. Cite the chart. In `score_evidence`, `source_url` is the image URL and
-   `table_reference` is `Chart image on <source document URL>: panel
-   "<exact panel/benchmark title>", bar "<exact bar label>", printed value
-   "<exact text>"`. Use the same citation in any `validation_evidence` entry
-   that relies on the chart, and list the source document in `source_coverage`
-   with the chart named in the outcome detail.
+1. Every `results_image` entry in `/tmp/url_candidates.json`
+   `source_documents` is a results table or chart that the preflight already
+   downloaded from the paper's page (`local_path`; `alt` is its caption). Open
+   each one with the `view_image` tool before you enumerate benchmarks, and give
+   each one its own `source_coverage` entry (its `url`) that lists every
+   benchmark it shows. The server rejects proposals that omit one. Use status
+   `unavailable` only if the file cannot be opened.
+2. For other source documents, open any embedded image whose caption, alt text,
+   or file name suggests results (`<img>`, Markdown `![...](...)`). An image the
+   page itself embeds is first-party whatever host serves it (release pages
+   often use a CDN such as `storage.googleapis.com`). Download it to
+   `/tmp/charts/` with Python (`urllib.request`, browser User-Agent), preferring
+   a linked full-size original, then open it with `view_image`.
+3. Import only values printed in the image as numbers (a table cell, or a data
+   label on or above a bar). Never estimate a value from bar height, axis
+   gridlines, or pixel position; skip unlabeled bars.
+4. The cell, column, or bar must unambiguously belong to the introduced model:
+   its header, label, or legend entry names the release. Comparator columns
+   and bars stay excluded, as in text tables.
+5. Apply every text-table rule: exact benchmark version, split, setting
+   (thinking/tools/pass@k), metric definition, and scale. A row label such as
+   `OSWorld-2.1 (Offline subset)` or a panel title names the benchmark; a
+   footnote or a linked methodology page may define the protocol. If the image
+   and its linked notes omit protocol details that the leaderboard needs, skip
+   and report.
+6. Cite the image. In `score_evidence`, `source_url` is the image URL and
+   `table_reference` is `Results image on <page URL>: row/panel "<exact
+   benchmark label>", column/bar "<exact model label>", printed value "<exact
+   text>"`. Use the same citation in any `validation_evidence` entry that
+   relies on the image.
 
-Prefer a text table whenever both exist; the chart only fills gaps. Report
-which values came from charts in the audit.
+Prefer a text table whenever both carry the same score; images fill gaps.
+Report which values came from images in the audit.
+
+Each job has a budget of 150 `leaderboards` lookups; past it the command
+fails with HTTP 429 `Scoped query limit reached`. Look up the headline
+benchmarks of the release page or main results table first, then the long
+tail (for example a model card's base-model table). If you hit the limit,
+keep going: submit every eligible result whose leaderboard you already
+retrieved, and report each benchmark you could not look up as
+`not_applicable` with detail `leaderboard lookup budget exhausted`. A lookup
+failure for some benchmarks never justifies skipping verified ones.
 
 Query every benchmark the paper reports under its exact name and common
 variants (for example `ImageNet`, `ImageNet-1K`, `ILSVRC-2012`); the first match
@@ -264,14 +294,17 @@ item and report the benchmark as a `not_applicable` outcome with `task_id`,
 sync. Other models and other leaderboards follow the normal rules.
 
 Never submit results for an unfinished checkpoint. When the source marks the
-evaluated model as still training, under revision, a preview or interim
-checkpoint, or an intermediate training step (check page headers and footers,
-title notes, and model card status; the Avalon-M1 report stamps every page
-"Model still training, under revision"), submit no `evaluations` and no
+evaluated model as still training, under revision, or an intermediate
+training step (check page headers and footers, title notes, and model card
+status; the Avalon-M1 report stamps every page "Model still training, under
+revision"), submit no `evaluations` and no
 `benchmark_gaps` for that model. Report each of its benchmarks as
 `not_paper_native`, with a `detail` that quotes the source's marking. Results
 for a paper's final model stay eligible even if the paper also analyzes
-earlier checkpoints.
+earlier checkpoints. A release name such as "Preview", "Beta", or
+"Experimental" is not such a mark: a publicly released model with that label
+(for example Ripple-65B Preview, an Apache-2.0 open-weight release) is
+finished, and its results are eligible.
 
 For `add-evals`, when a paper-native result is blocked by missing catalog configuration, include
 one structured `benchmark_gaps` entry conforming to

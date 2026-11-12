@@ -14,8 +14,14 @@ from backend.models.database import (
     Base,
     Dataset,
     Evaluation,
+    HfArtifact,
     Metric,
+    ModelProviderAlias,
+    ModelRelease,
+    ModelReleaseArtifact,
+    ModelReleaseSignal,
     Paper,
+    PaperHfArtifact,
     PaperTask,
     Task,
     TaskDataset,
@@ -32,10 +38,12 @@ from backend.services.open_asr_sync_service import (
     OpenAsrPaperDiscoveryService,
     OpenAsrSyncService,
     _model_identity_matches_paper,
+    default_table_columns,
     display_model_names,
     fetch_open_asr_leaderboard,
     parse_open_asr_leaderboard,
 )
+from backend.tests.evaluation.model_evidence import add_release_evidence
 
 
 @compiles(BigInteger, "sqlite")
@@ -79,6 +87,12 @@ def _session() -> Session:
             TaskDatasetMetric.__table__,
             Evaluation.__table__,
             PaperTask.__table__,
+            HfArtifact.__table__,
+            PaperHfArtifact.__table__,
+            ModelRelease.__table__,
+            ModelReleaseArtifact.__table__,
+            ModelProviderAlias.__table__,
+            ModelReleaseSignal.__table__,
         ],
     )
     session = Session(engine)
@@ -122,6 +136,32 @@ def _session() -> Session:
     return session
 
 
+SPACE_DEFAULT_COLUMNS = ["RTFx ⬆️️", "AMI-Cleaned", "SPGISpeech"]
+
+
+def _view_api(*, return_format, print_info, default=SPACE_DEFAULT_COLUMNS):
+    assert (return_format, print_info) == ("dict", False)
+    parameters = [
+        {"parameter_name": "version_id", "parameter_default": "latest"},
+        {"parameter_name": "selected_columns", "parameter_default": list(default)},
+    ]
+    return {"named_endpoints": {"/_main_table_update": {"parameters": parameters}}}
+
+
+def test_default_columns_follow_space_and_keep_license_once():
+    class Client:
+        view_api = staticmethod(_view_api)
+
+    assert default_table_columns(Client()) == [*SPACE_DEFAULT_COLUMNS, "License"]
+
+    class LicensedClient:
+        @staticmethod
+        def view_api(**kwargs):
+            return _view_api(**kwargs, default=["License", "AMI-Cleaned"])
+
+    assert default_table_columns(LicensedClient()) == ["License", "AMI-Cleaned"]
+
+
 def test_parse_and_fetch_public_leaderboard_contract():
     payload = _payload()
 
@@ -129,6 +169,8 @@ def test_parse_and_fetch_public_leaderboard_contract():
         def __init__(self, url, *, verbose):
             assert url == SPACE_APP_URL
             assert verbose is False
+
+        view_api = staticmethod(_view_api)
 
         def predict(
             self,
@@ -142,23 +184,9 @@ def test_parse_and_fetch_public_leaderboard_contract():
         ):
             assert version_id == "latest"
             assert (search_query, show_proprietary, show_llm) == ("", True, False)
-            # The current English default averages all eleven datasets. Keeping
-            # the old Earnings22 name fails; omitting a dataset changes scores.
-            assert selected_columns == [
-                "RTFx ⬆️️",
-                "License",
-                "AMI-Cleaned",
-                "Earnings22-Cleaned-AA-chunked",
-                "Gigaspeech-Cleaned",
-                "LS Clean",
-                "LS Other",
-                "SPGISpeech",
-                "URGENT24",
-                "Voice Arena Monsoon",
-                "Voxpopuli-AA-Cleaned",
-                "Private (scripted)",
-                "Private (conversational)",
-            ]
+            # The Space's published default decides which datasets the
+            # average covers; License is added only to read open status.
+            assert selected_columns == [*SPACE_DEFAULT_COLUMNS, "License"]
             assert api_name == "/_main_table_update"
             return {
                 "datatype": ["str", "str", "markdown", "number", "number"],
@@ -168,6 +196,25 @@ def test_parse_and_fetch_public_leaderboard_contract():
     entries = fetch_open_asr_leaderboard(FakeClient)
     assert entries[0] == OpenAsrEntry("org/model-1", 1, 4.1, None, False)
     assert entries[1] == OpenAsrEntry("org/model-2", 2, 4.2, 20.0, True)
+
+
+def test_fetch_accepts_table_and_plot_update_tuple():
+    payload = _payload()
+
+    class FakeClient:
+        def __init__(self, url, *, verbose):
+            pass
+
+        view_api = staticmethod(_view_api)
+
+        def predict(self, **_kwargs):
+            table = {"datatype": ["str"], "value": payload}
+            plot = {"value": {"type": "plotly", "plot": "{}"}}
+            return (table, plot)
+
+    entries = fetch_open_asr_leaderboard(FakeClient)
+    assert len(entries) == 40
+    assert entries[0] == OpenAsrEntry("org/model-1", 1, 4.1, None, False)
 
 
 def test_parser_rejects_truncated_or_noncontiguous_data():
@@ -341,6 +388,7 @@ def test_sync_replaces_legacy_and_only_deletes_stale_managed_rows(monkeypatch):
         "created": 2,
         "updated": 0,
         "deleted": 2,
+        "auto_matched": [],
         "unmatched_models": ["vendor/unmatched"],
         "missing_papers": [],
     }
@@ -431,6 +479,38 @@ def test_discovered_paper_creates_managed_row_and_task_link():
     task_link = session.query(PaperTask).filter(PaperTask.paper_id == paper.id).one()
     assert task_link.task_id == 12
     assert task_link.source == "auto"
+
+
+def test_unknown_models_match_announcements_or_become_radar_signals():
+    session = _session()
+    session.add(
+        Paper(
+            id=3,
+            title="Introducing Scribe v3",
+            source="external",
+            source_url="https://example.com/scribe-v3",
+            version="v1",
+            is_latest_version=True,
+        )
+    )
+    add_release_evidence(session, 3)
+    session.commit()
+
+    stats = OpenAsrSyncService(session).sync(
+        [
+            OpenAsrEntry("vendor/scribe-v3", 1, 4.1, None, False),
+            OpenAsrEntry("other-lab/Ear-2", 2, 4.9, None, False),
+        ],
+        fetched_at=datetime(2026, 11, 9, 12, 0, tzinfo=UTC),
+    )
+
+    assert stats.auto_matched == ["vendor/scribe-v3"]
+    assert stats.unmatched_models == ["other-lab/Ear-2"]
+    row = session.query(Evaluation).filter(Evaluation.paper_id == 3).one()
+    assert (row.model_name, row.metrics) == ("scribe-v3", {"WER": 4.1})
+    assert session.query(PaperTask).filter(PaperTask.paper_id == 3).one().task_id == 12
+    signal = session.query(ModelReleaseSignal).one()
+    assert (signal.lab, signal.model_name) == ("other-lab", "Ear-2")
 
 
 def test_display_names_drop_org_and_hf_suffix_but_keep_runtime_and_collisions():

@@ -10,6 +10,7 @@ let intersecting = true;
 const intersectionObservers: Array<{ element: Element; rootMargin: string; callback: IntersectionObserverCallback }> = [];
 const reactPdf = vi.hoisted(() => ({
   documentOptions: [] as unknown[],
+  files: [] as unknown[],
   renders: [] as Array<() => void>,
   holdRenders: false,
   pageText: [] as string[],
@@ -50,8 +51,9 @@ vi.mock("./PdfToolbar", () => ({
 }));
 
 vi.mock("react-pdf", () => ({
-    Document: ({ children, onLoadSuccess, onLoadError, onItemClick, options }: {
+    Document: ({ children, file, onLoadSuccess, onLoadError, onItemClick, options }: {
       children: React.ReactNode;
+      file?: unknown;
       onLoadSuccess: (pdf: { numPages: number }) => void;
       onLoadError: (error: Error) => void;
       onItemClick?: (item: { pageNumber: number; pageIndex: number }) => void;
@@ -60,6 +62,7 @@ vi.mock("react-pdf", () => ({
       // Match React-PDF's LinkService, which retains the first callback.
       const initialItemClick = React.useRef(onItemClick);
       reactPdf.documentOptions.push(options);
+      reactPdf.files.push(file);
       return <div>
         <button onClick={() => onLoadSuccess(outlinePdf(1))}>Load PDF</button>
         <button onClick={() => onLoadSuccess(outlinePdf(13))}>Load long PDF</button>
@@ -87,7 +90,8 @@ vi.mock("react-pdf", () => ({
     },
 }));
 
-import { highlightPdfText, PdfViewer } from "./PdfViewer";
+import { PdfViewer } from "./PdfViewer";
+import { highlightPdfText } from "./usePdfSearch";
 
 const render = (ui: React.ReactElement) => renderWithoutQueries(ui, {
   wrapper: ({ children }) => <QueryClientProvider client={new QueryClient()}>{children}</QueryClientProvider>,
@@ -115,6 +119,7 @@ describe("PdfViewer resize rendering", () => {
     intersectionObservers.length = 0;
     resizeCallback = undefined;
     reactPdf.documentOptions.length = 0;
+    reactPdf.files.length = 0;
     reactPdf.renders.length = 0;
     reactPdf.holdRenders = false;
     reactPdf.pageText = [];
@@ -225,7 +230,7 @@ describe("PdfViewer resize rendering", () => {
     expect(onPageChange).not.toHaveBeenCalled();
   });
 
-  it("keeps the rendered pages and live scale after divider dragging ends", async () => {
+  it("re-renders sharp pages at the new width once divider dragging ends", async () => {
     const view = render(<PdfViewer
       url="https://arxiv.org/pdf/1706.03762"
       paperKey="1706.03762"
@@ -255,10 +260,8 @@ describe("PdfViewer resize rendering", () => {
       paperTitle="Attention Is All You Need"
       paperHref="/paper/1706.03762"
     />);
-    await waitFor(() => expect(screen.getByTestId("pdf-page")).toHaveAttribute("data-width", "790"));
-    expect(screen.getByTestId("pdf-page").closest(".pdf-pages")).toHaveStyle({
-      "--pdf-live-scale": String(610 / 790),
-    });
+    await waitFor(() => expect(screen.getByTestId("pdf-page")).toHaveAttribute("data-width", "610"));
+    expect(screen.getByTestId("pdf-page").closest(".pdf-pages")).toHaveStyle({ "--pdf-live-scale": "1" });
   });
 
   it("centers the document horizontally after zooming", () => {
@@ -562,6 +565,41 @@ describe("PdfViewer resize rendering", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Paper content is still being prepared. Please try again later.",
     );
+  });
+
+  it("reads the original PDF while the archived copy is not ready", () => {
+    render(<PdfViewer
+      url="/paper-assets/external/96723/paper.pdf"
+      fallbackUrl="https://example.github.io/static/paper.pdf"
+      paperKey="96723"
+      paperTitle="External paper"
+      paperHref="/paper/96723"
+      loadErrorMessage="Paper content is still being prepared. Please try again later."
+    />);
+    expect(reactPdf.files.at(-1)).toBe("/paper-assets/external/96723/paper.pdf");
+
+    fireEvent.click(screen.getByRole("button", { name: "Fail PDF" }));
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(reactPdf.files.at(-1)).toBe("https://example.github.io/static/paper.pdf");
+
+    // When the original PDF fails too, the reader explains why; Retry tries our copy again.
+    fireEvent.click(screen.getByRole("button", { name: "Fail PDF" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Paper content is still being prepared.");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(reactPdf.files.at(-1)).toBe("/paper-assets/external/96723/paper.pdf");
+  });
+
+  it("reloads the document from scratch on Retry", () => {
+    render(<PdfViewer url="https://arxiv.org/pdf/2609.18063" paperKey="2609.18063" paperTitle="edge0" paperHref="/paper/2609.18063" />);
+    fireEvent.click(screen.getByRole("button", { name: "Fail PDF" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("The PDF source could not be loaded in this browser.");
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load long PDF" }));
+    expect(screen.getByRole("region", { name: "Paper PDF" }).querySelectorAll("[data-page]")).toHaveLength(13);
   });
 
   it("provides application-owned canvas controls for a private paper preview", async () => {

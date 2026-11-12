@@ -76,6 +76,7 @@ Matching rules:
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import defaultdict
 import dataclasses
 from dataclasses import dataclass
@@ -86,7 +87,9 @@ from sqlalchemy.orm import Session
 
 MAX_NAME_TOKENS = 16
 
-_TOKEN = re.compile(r"[^\W_](?:[\w.+]*[\w+])?")
+# "@" stays inside a token, so metrics such as Pass@1 match only as written.
+_TOKEN = re.compile(r"[^\W_](?:[\w.+@]*[\w+])?")
+_PLAIN_TOKEN = re.compile(r"[^\W_](?:[\w.+]*[\w+])?")
 _SEPARATOR = re.compile(r"[\s\-_/'’]+")
 _QUALIFIER = re.compile(r"\s*(?:\([^()]*\)|\s—\s.*)\s*$")
 _MATH = re.compile(r"\$\$.+?\$\$|\$[^$]+\$|https?://\S+", re.S)
@@ -198,8 +201,8 @@ def _case_sensitive(entity: CatalogEntity, tokens: tuple[str, ...]) -> bool:
     if len(tokens) > 1:
         return False
     token = tokens[0]
-    if re.search(r"\d|[a-z][A-Z]", token):
-        return False  # GSM8K, ImageNet, LLaVA, DeltaNet never spell an ordinary word
+    if re.search(r"\d|[a-z][A-Z]|@", token):
+        return False  # GSM8K, ImageNet, LLaVA, DeltaNet, pass@k never spell an ordinary word
     return not (entity.entity_type == "method" and _PLAIN_WORD.fullmatch(token))
 
 
@@ -527,7 +530,7 @@ def find_candidates(abstract: str, index: MentionIndex) -> list[Candidate]:
     if not abstract or not index.surfaces:
         return []
     masked = _masked(abstract)
-    tokens = list(_TOKEN.finditer(masked))
+    tokens = _text_tokens(masked, index)
     words = [t.group() for t in tokens]
     lowered = [w.lower() for w in words]
     candidates: list[Candidate] = []
@@ -555,7 +558,7 @@ def find_candidates(abstract: str, index: MentionIndex) -> list[Candidate]:
                     start, end = expanded
                     candidates = [c for c in candidates if c.end <= start]
                 elif surface.rank == ABBREVIATION and not _shares_long_form(
-                    index, tokens[:i], surface
+                    index, tokens[:i], surface, masked[start:end]
                 ):
                     redefined.add(
                         (surface.entity.entity_type, surface.entity.entity_id)
@@ -677,11 +680,79 @@ def _expand_long_form(index, masked, before, start, end, surface):
     return None
 
 
-def _shares_long_form(index: MentionIndex, before: list[re.Match], surface) -> bool:
-    """``preference optimization (DPO)`` shortens DPO's own long form."""
-    words = {t.group().lower() for t in before[-4:]}
+# Function words never start an expansion, so "during preference optimization
+# (DPO)" still shortens Direct Preference Optimization.
+_FUNCTION_WORDS = {
+    "a", "about", "after", "also", "an", "and", "are", "as", "at", "be",
+    "before", "between", "both", "but", "by", "called", "can", "do", "does",
+    "during", "each", "either", "for", "from", "has", "have", "how", "if", "in",
+    "into", "is", "it", "its", "may", "named", "not", "of", "on", "or", "our",
+    "such", "termed", "than", "that", "the", "their", "these", "this",
+    "through", "to", "under", "using", "via", "we", "what", "when", "where",
+    "which", "while", "with", "within", "without",
+}  # fmt: skip
+# Words an expansion may add without naming something else: "Segment Anything
+# Foundation Model (SAM)", "iterative closest point algorithm (ICP)".
+_IGNORED_WORDS = _FUNCTION_WORDS | {
+    "algorithm", "based", "foundation", "like", "model", "models", "pre",
+    "pretrained", "trained",
+}  # fmt: skip
+
+
+_WORD_FORMS = {"visual": "vision"}
+
+
+def _plain_word(word: str) -> str:
+    word = unicodedata.normalize("NFKD", word).encode("ascii", "ignore").decode()
+    return _WORD_FORMS.get(word, word)
+
+
+def _same_word(word: str, form: tuple[str, ...]) -> bool:
+    """``quantizer``/``quantization``, ``grouped``/``group``, ``visual``/``vision``,
+    and joined spellings (``multilayer``, ``finetuning``) count as the same word."""
+    word = _plain_word(word)
+    form = tuple(_plain_word(w) for w in form)
+    stem = word[:-1] if len(word) > 4 and word.endswith("s") else word
+    return any(w[:4] == word[:4] or w.startswith(word) for w in form) or (
+        len(stem) > 4 and stem in "".join(form)
+    )
+
+
+def _shares_long_form(
+    index: MentionIndex, before: list[re.Match], surface, short: str
+) -> bool:
+    """``preference optimization (DPO)`` shortens DPO's own long form, but
+    ``Rejection sampling Fine-Tuning (RFT)`` is not ``Reinforcement Fine-Tuning``.
+
+    The written expansion starts at the nearest content word with the
+    abbreviation's first letter. It shares a long form when each of its words is
+    a form of a long-form word, allowing one other word in expansions of three
+    or more. Without such a word, any shared word counts."""
     key = (surface.entity.entity_type, surface.entity.entity_id)
-    return any(words & set(form) for form in index.long_forms.get(key, ()))
+    forms = index.long_forms.get(key, ())
+    words = [t.group().lower() for t in before[-6:]]
+    first = short[:1].lower()
+    expansions = [
+        [
+            w
+            for w in words[i:]
+            if w not in _IGNORED_WORDS
+            and len(w) > 1
+            and not any(c.isdigit() for c in w)
+        ]
+        for i, word in enumerate(words)
+        if word.startswith(first) and word not in _FUNCTION_WORDS
+    ]
+    # The nearest start with something to compare: a trailing "Model" alone
+    # says nothing about which long form the abstract means.
+    content = next((found for found in reversed(expansions) if found), None)
+    if content is None:
+        return any(set(words[-4:]) & set(form) for form in forms)
+    for form in forms:
+        unmatched = sum(not _same_word(w, form) for w in content)
+        if unmatched == 0 or (unmatched == 1 and len(content) >= 3):
+            return True
+    return False
 
 
 def _defined_in_brackets(text_value: str, start: int, end: int) -> bool:
@@ -729,6 +800,18 @@ def _is_capitalised_plain_word(surface: _Surface, written: str) -> bool:
         and not surface.case_sensitive
         and written[:1].isupper()
     )
+
+
+def _text_tokens(masked: str, index: MentionIndex) -> list[re.Match]:
+    """Keep ``pass@1`` whole when the catalog names it; otherwise ``BLEU@4`` is
+    read as ``BLEU`` and ``4``."""
+    tokens = []
+    for token in _TOKEN.finditer(masked):
+        if "@" in token.group() and (token.group().lower(),) not in index.surfaces:
+            tokens.extend(_PLAIN_TOKEN.finditer(masked, token.start(), token.end()))
+        else:
+            tokens.append(token)
+    return tokens
 
 
 def _longest_match(index, masked, tokens, words, lowered, i):

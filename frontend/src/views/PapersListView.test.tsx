@@ -10,14 +10,15 @@ let searchInfiniteState: Record<string, unknown>;
 const paperParams = vi.fn();
 const searchParamsSpy = vi.fn();
 
+// Feed request filters are the last element of each feed's query key.
 vi.mock("@/hooks/usePapers", () => ({
-  useInfinitePapers: (params: unknown) => {
-    paperParams(params);
+  usePaperFeedQuery: (key: unknown[]) => {
+    if (key[0] === "paper-search-feed") {
+      searchParamsSpy(key.at(-1));
+      return searchInfiniteState;
+    }
+    paperParams(key.at(-1));
     return infiniteState;
-  },
-  useInfinitePaperSearch: (params: unknown) => {
-    searchParamsSpy(params);
-    return searchInfiniteState;
   },
 }));
 
@@ -25,12 +26,13 @@ vi.mock("@/hooks/useDebounce", () => ({ useDebounce: (value: string) => value })
 vi.mock("@/hooks/useIntersectionObserver", () => ({
   useIntersectionObserver: () => ({ targetRef: { current: null }, isIntersecting: false }),
 }));
-vi.mock("@tanstack/react-query", () => ({
+vi.mock("@tanstack/react-query", async (importOriginal) => ({
+  ...await importOriginal<object>(),
   useQuery: () => ({ data: [] }),
 }));
-vi.mock("@/components", () => ({
-  Icon: () => <span />,
-  PaperCard: () => <article />,
+vi.mock("@/components/Icon", () => ({ Icon: () => <span /> }));
+vi.mock("@/components/PaperCard", () => ({ PaperCard: () => <article /> }));
+vi.mock("@/components/Chips", () => ({
   TagChip: ({ slug, label }: { slug: string; label: string }) => (
     <a href={`/tasks/${slug}`}>{label}</a>
   ),
